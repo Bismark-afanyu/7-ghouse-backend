@@ -8,9 +8,12 @@ class Settings(BaseSettings):
     FIREBASE_CREDENTIALS_PATH: str = os.getenv("FIREBASE_CREDENTIALS_PATH", "firebase-adminsdk.json")
     FIREBASE_STORAGE_BUCKET: str = os.getenv("FIREBASE_STORAGE_BUCKET", "seven-g-house.appspot.com")
     OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
+    NANO_BANANA_API_KEY: str = os.getenv("NANO_BANANA_API_KEY", "")
+    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
 
     class Config:
         env_file = ".env"
+        extra = "ignore"
 
 settings = Settings()
 
