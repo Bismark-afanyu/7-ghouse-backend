@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import StreamingResponse
 from app.core.auth_middleware import verify_token
 from app.schemas.generation import GenerationRequest, GenerationResponse, GenerationHistoryItem, WorkspaceResponse, SingleRoomRequest, SaveGenerationRequest, GenerationImage, GenerationUpdate
 from app.services import ai_service, storage_service
@@ -8,51 +9,74 @@ import uuid
 router = APIRouter()
 
 
-@router.post("/generate", response_model=WorkspaceResponse)
+import json
+
+@router.post("/generate")
 async def generate_design(request: GenerationRequest, user=Depends(verify_token)):
-    """Generate initial AI exterior house design concepts without saving to database."""
+    """Generate initial AI exterior house design concepts with real-time SSE progress."""
     user_id = user["uid"]
 
-    try:
-        # 1. Generate images using AI
-        prompt_used, labeled_images = await ai_service.generate_images(
-            property_type=request.property_type,
-            num_rooms=request.num_rooms,
-            land_size=request.land_size,
-            architectural_style=request.architectural_style,
-            additional_preferences=request.additional_preferences,
-        )
+    async def event_generator():
+        try:
+            # Create a temporary generation ID for storage paths
+            generation_id = uuid.uuid4().hex
+            uploaded_images = []
+            prompt_used = ""
+            idx = 0
 
-        # 2. Create a temporary generation ID for storage paths
-        generation_id = uuid.uuid4().hex
+            # Yield an initial progress event
+            yield f"data: {json.dumps({'status': 'progress', 'message': 'Initializing AI engines...'})}\n\n"
 
-        # 3. Upload images to cloud storage (temporary/workspace location)
-        uploaded_images = []
-        for idx, (label, img_bytes) in enumerate(labeled_images):
-            img_data = await storage_service.upload_image(
-                image_bytes=img_bytes,
-                user_id=user_id,
-                generation_id=generation_id,
-                index=idx,
-            )
-            uploaded_images.append(
-                GenerationImage(
-                    url=img_data["url"],
-                    storage_path=img_data["storage_path"]
-                )
-            )
+            async for event in ai_service.generate_images_stream(
+                property_type=request.property_type,
+                num_rooms=request.num_rooms,
+                land_size=request.land_size,
+                architectural_style=request.architectural_style,
+                additional_preferences=request.additional_preferences,
+            ):
+                if event["type"] in ["progress", "view_list", "view_start", "view_complete", "view_error", "error"]:
+                    # Send structured event to the client
+                    yield f"data: {json.dumps({'status': event['type'], **event})}\n\n"
+                    if event["type"] == "error":
+                        return # Stop stream on fatal error
+                
+                elif event["type"] == "master_prompt":
+                    prompt_used = event["prompt"]
+                
+                elif event["type"] == "image":
+                    # Upload the image chunk to cloud storage
+                    label_str = event["label"]
+                    yield f"data: {json.dumps({'status': 'progress', 'message': f'Uploading {label_str}...'})}\n\n"
+                    
+                    img_data = await storage_service.upload_image(
+                        image_bytes=event["bytes"],
+                        user_id=user_id,
+                        generation_id=generation_id,
+                        index=idx,
+                    )
+                    idx += 1
+                    
+                    uploaded_images.append({
+                        "url": img_data["url"],
+                        "storage_path": img_data["storage_path"],
+                        "label": event["label"]
+                    })
+                    
+            # Final yield with the complete workspace payload
+            workspace_payload = {
+                "generation_id": generation_id,
+                "images": uploaded_images,
+                "prompt_used": prompt_used,
+            }
+            yield f"data: {json.dumps({'status': 'complete', 'workspace': workspace_payload})}\n\n"
 
-        return WorkspaceResponse(
-            generation_id=generation_id,
-            images=uploaded_images,
-            prompt_used=prompt_used,
-        )
+        except Exception as e:
+            # We must yield an error event since the HTTP status is already 200 OK (stream started)
+            error_payload = {"status": "error", "detail": f"Generation failed: {str(e)}"}
+            yield f"data: {json.dumps(error_payload)}\n\n"
 
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Generation failed: {str(e)}",
-        )
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
 
 
 @router.post("/generate/room", response_model=GenerationImage)

@@ -1,6 +1,8 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, File, UploadFile
 from app.core.auth_middleware import verify_token, require_admin
 from app.repositories import user_repository
+import os
+import shutil
 from pydantic import BaseModel
 from typing import Optional
 
@@ -15,8 +17,37 @@ class UserCreateRequest(BaseModel):
 
 @router.get("/me")
 async def get_me(user=Depends(verify_token)):
-    """Get current user profile and role."""
+    """Get current user profile including data from Firestore."""
+    firestore_user = await user_repository.get_user_by_id(user["uid"])
+    if firestore_user:
+        # Merge firestore data (role, photo_url, etc) into the auth user data
+        user.update(firestore_user)
     return user
+
+@router.post("/me/avatar")
+async def upload_avatar(file: UploadFile = File(...), user=Depends(verify_token)):
+    """Upload a profile picture to local storage."""
+    # Create avatars directory
+    avatar_dir = os.path.join("static", "avatars")
+    if not os.path.exists(avatar_dir):
+        os.makedirs(avatar_dir)
+        
+    # Generate filename
+    ext = os.path.splitext(file.filename)[1]
+    filename = f"{user['uid']}{ext}"
+    file_path = os.path.join(avatar_dir, filename)
+    
+    # Save file
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+        
+    # URL to access the file
+    avatar_url = f"/static/avatars/{filename}"
+    
+    # Update Firestore instead of Firebase Auth (which rejects relative URLs)
+    await user_repository.update_user(user['uid'], {"photo_url": avatar_url})
+    
+    return {"avatar_url": avatar_url}
 
 @router.get("/", dependencies=[Depends(require_admin)])
 async def get_all_users():

@@ -30,6 +30,7 @@ async def get_user_by_id(uid: str) -> dict:
             "email": data.get("email"),
             "display_name": data.get("display_name"),
             "job_title": data.get("job_title"),
+            "photo_url": data.get("photo_url"),
             "role": data.get("role", "user"),
             "created_at": data.get("created_at")
         }
@@ -49,6 +50,7 @@ async def list_users() -> list:
             "email": data.get("email"),
             "display_name": data.get("display_name"),
             "job_title": data.get("job_title"),
+            "photo_url": data.get("photo_url"),
             "role": data.get("role", "user"),
             "created_at": data.get("created_at")
         })

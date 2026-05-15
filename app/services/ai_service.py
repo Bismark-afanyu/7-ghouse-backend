@@ -8,6 +8,59 @@ from typing import Optional
 from app.db.firebase import settings
 
 
+def is_multi_story(property_type: str) -> bool:
+    """Determine if a property type typically has multiple stories."""
+    multi_story_types = ["Duplex", "Townhouse", "Mansion", "Apartment Building"]
+    return property_type in multi_story_types
+
+
+def get_views_to_generate(property_type: str) -> list[str]:
+    """Dynamically determine the list of views to generate based on property type."""
+    views = [
+        "composite_presentation",
+        "exterior_front",
+        "exterior_angled",
+        "exterior_rear",
+        "2d_blueprint_ground",
+    ]
+    
+    if is_multi_story(property_type):
+        views.append("2d_blueprint_upper")
+    
+    views.extend([
+        "3d_topdown_ground",
+    ])
+    
+    if is_multi_story(property_type):
+        views.append("3d_topdown_upper")
+        
+    views.extend([
+        "interior_living",
+        "interior_bedroom",
+        "interior_kitchen",
+        "interior_bathroom",
+    ])
+    return views
+
+
+def get_view_labels() -> dict[str, str]:
+    """Return human-friendly labels for all possible view types."""
+    return {
+        "composite_presentation": "Presentation Suite",
+        "exterior_front": "Front View",
+        "exterior_angled": "Angled View",
+        "exterior_rear": "Rear View",
+        "2d_blueprint_ground": "2D Plan (Ground)",
+        "2d_blueprint_upper": "2D Plan (Upper)",
+        "3d_topdown_ground": "3D Plan (Ground)",
+        "3d_topdown_upper": "3D Plan (Upper)",
+        "interior_living": "Living Room",
+        "interior_bedroom": "Master Bedroom",
+        "interior_kitchen": "Kitchen",
+        "interior_bathroom": "Bathroom",
+    }
+
+
 def build_prompt(
     property_type: str,
     num_rooms: int,
@@ -27,45 +80,85 @@ def build_prompt(
         "Maintain a clean, premium interior design look with photorealistic materials and textures, high detail, interior design visualization quality, no text, no UI elements."
     )
     
+    # Detailed Architectural Anchor Points - These force the AI to keep the same 'DNA'
+    # We use very specific descriptors that the model can easily replicate across views
+    architectural_dna = (
+        f"This specific {property_type} has a distinctive modern geometry: "
+        "A flat-roofed structure with a cantilevered second floor that overhangs a stone-paved terrace. "
+        "The facade is a precise mix of vertical light-oak wood slats, smooth matte-white plaster, "
+        "and oversized charcoal-framed floor-to-ceiling windows. "
+        "A floating black metal staircase is visible through the main glass entry. "
+        "The landscaping features drought-resistant grasses and soft perimeter up-lighting."
+    )
+    
+    # Master Design Seed - Enforcing structural consistency across all prompts
+    master_seed = (
+        f"A cohesive {architectural_style} {property_type}. "
+        f"{architectural_dna} "
+        "Every view must show the EXACT SAME building materials, colors, and structural geometry. "
+        "Consistency is mandatory."
+    )
+    
     base_info = f"{architectural_style} style {property_type} with {num_rooms} rooms on a {land_size} plot."
     
     prompts = {
-        "2d_blueprint": (
-            f"A professional, industry-standard 2D architectural floor plan blueprint of a {base_info}. "
-            f"Black and white technical drawing, clean lines, precise labels, dimension lines with measurements. "
-            f"Shows a cohesive layout with a living room, bedroom (bed on right, windows in front), bathroom (bathtub on left, basin in front, toilet on right), and kitchen. "
-            f"Best practices architectural documentation style."
+        "composite_presentation": (
+            f"An industry-standard architectural presentation board of a {base_info}. "
+            "Split-screen layout. TOP HALF: A photorealistic high-end 3D exterior rendering of the house with professional lighting and landscaping. "
+            "BOTTOM HALF: A detailed 3D top-down isometric floor plan cutaway of the EXACT SAME house, showing the interior furniture and layout perfectly matching the exterior structure. "
+            f"Style: {wabi_sabi_style} 8K resolution, architectural visualization masterpiece."
         ),
-        "3d_exterior": (
+        "exterior_front": (
             f"A photorealistic high-end exterior architectural rendering of a {base_info}. "
-            f"Front perspective view, professional lighting, landscaped surroundings, blue sky. "
-            f"Exterior materials feature natural wood, textured plaster, and soft stone to match the interior wabi-sabi theme. Ultra-detailed, 8K resolution."
+            "FRONT ELEVATION perspective view, eye-level, professional lighting, landscaped surroundings, blue sky. "
+            f"{master_seed} Ultra-detailed, 8K resolution."
         ),
-        "3d_topdown": (
-            f"A realistic top-down interior render (bird's-eye view) of a {base_info} showing how the home would look in real life. "
-            f"Keep all room positions accurate: living room, bedroom (bed on right), bathroom (bathtub on left, basin in front, toilet on right), kitchen, dining area, and entryway. "
-            f"Redesign the entire space in a {wabi_sabi_style} Realistic proportions, soft shadows, ar 4:5."
+        "exterior_angled": (
+            f"A photorealistic high-end exterior architectural rendering of a {base_info}. "
+            "ANGLED STREET PERSPECTIVE view (45-degree angle), showing the depth and side of the property. "
+            f"{master_seed} Professional lighting, lush landscaping, 8K resolution."
+        ),
+        "exterior_rear": (
+            f"A photorealistic high-end exterior architectural rendering of a {base_info}. "
+            "REAR ELEVATION view from the backyard, showing the back patio, pool, or garden area. "
+            f"{master_seed} Soft evening lighting, architectural visualization quality."
+        ),
+        "2d_blueprint_ground": (
+            f"A professional, industry-standard 2D architectural floor plan blueprint of the GROUND FLOOR of a {base_info}. "
+            "Black and white technical drawing, clean lines, precise labels, dimension lines with measurements. "
+            "Shows a cohesive layout matching the master design. Best practices architectural documentation style."
+        ),
+        "2d_blueprint_upper": (
+            f"A professional, industry-standard 2D architectural floor plan blueprint of the UPPER/FIRST FLOOR of a {base_info}. "
+            "Black and white technical drawing, clean lines, precise labels. Shows staircases and upper level rooms."
+        ),
+        "3d_topdown_ground": (
+            f"A realistic 3D top-down interior render (bird's-eye view cutaway) of the GROUND FLOOR of a {base_info}. "
+            f"{master_seed} {wabi_sabi_style} Realistic proportions, soft shadows, ar 4:5."
+        ),
+        "3d_topdown_upper": (
+            f"A realistic 3D top-down interior render (bird's-eye view cutaway) of the UPPER FLOOR of a {base_info}. "
+            f"{master_seed} {wabi_sabi_style} Consistent with ground floor structural walls."
         ),
         "interior_living": (
-            f"Generate an interior image of the living room space on an eye level following faithfully to the top down reference. "
-            f"Follow the top down reference for furniture placements. Style: {wabi_sabi_style} ar 4:5."
+            f"Eye-level interior rendering of the living room following the {master_seed}. "
+            f"Large windows, premium materials. Style: {wabi_sabi_style} ar 4:5."
         ),
         "interior_bedroom": (
-            f"Generate an interior image of the bedroom space on an eye level following faithfully to the top down reference. "
-            f"Door on the left, windows in front, bed on the right. Follow the top down reference for furniture placements. Style: {wabi_sabi_style} ar 4:5."
+            f"Eye-level interior rendering of the master bedroom following the {master_seed}. "
+            f"Style: {wabi_sabi_style} ar 4:5."
         ),
         "interior_kitchen": (
-            f"Generate a wide angle interior image of the kitchen space on an eye level following faithfully to the top down reference. "
-            f"Open layout, island in the center, seamless integration with the dining area. Style: {wabi_sabi_style} ar 4:5."
+            f"Eye-level wide-angle interior rendering of the kitchen and dining area following the {master_seed}. "
+            f"Minimalist cabinetry, premium island. Style: {wabi_sabi_style} ar 4:5."
         ),
         "interior_bathroom": (
-            f"Generate a wide angle interior image of the bathroom space on an eye level following faithfully to the top down reference. "
-            f"Above the bathtub should have a shower head. Bathtub is on the left, basin is in front, toilet bowl on right and there is a cabinet with plant on top on the right wall near the door. "
-            f"Follow the top down image placement! Style: {wabi_sabi_style} ar 4:5."
+            f"Eye-level interior rendering of the luxury bathroom following the {master_seed}. "
+            f"Spa-like atmosphere. Style: {wabi_sabi_style} ar 4:5."
         ),
     }
     
-    prompt = prompts.get(view_type, prompts["3d_exterior"])
+    prompt = prompts.get(view_type, prompts["exterior_front"])
     if additional_preferences:
         prompt += f" Special user requirements to integrate: {additional_preferences}."
     
@@ -90,30 +183,8 @@ async def generate_images(
         placeholder_labels = ["2D Blueprint", "3D Exterior", "Top-Down View", "Living Room", "Master Bedroom", "Kitchen", "Bathroom"]
         return "Dev Mode Prompt", [(placeholder_labels[i], b) for i, b in enumerate(placeholder_bytes)]
 
-    views_to_generate = [
-        "2d_blueprint",
-        "3d_exterior",
-        "3d_topdown",
-        "interior_living",
-        "interior_bedroom",
-        "interior_kitchen",
-        "interior_bathroom",
-    ]
-    
-    all_images: list[tuple[str, bytes]] = []
-    reference_url = None
-    master_prompt = ""
-
-    # Human-friendly labels for the UI
-    labels = {
-        "2d_blueprint": "2D Blueprint",
-        "3d_exterior": "3D Exterior",
-        "3d_topdown": "Top-Down View",
-        "interior_living": "Living Room",
-        "interior_bedroom": "Master Bedroom",
-        "interior_kitchen": "Kitchen",
-        "interior_bathroom": "Bathroom",
-    }
+    views_to_generate = get_views_to_generate(property_type)
+    labels = get_view_labels()
 
     # Initialize the Gemini Client
     client = genai.Client(api_key=settings.GEMINI_API_KEY)
@@ -159,6 +230,87 @@ async def generate_images(
             print(f"❌ Gemini failed to generate {view}. No fallback configured.")
 
     return master_prompt, all_images
+
+
+async def generate_images_stream(
+    property_type: str,
+    num_rooms: int,
+    land_size: str,
+    architectural_style: str,
+    additional_preferences: Optional[str] = None,
+):
+    """
+    Generate a full Pro Architectural Suite via async generator.
+    Yields dicts representing progress or completed images.
+    """
+    api_key = settings.GEMINI_API_KEY
+    if not api_key:
+        yield {"type": "progress", "message": "Development Mode: Mocking images..."}
+        placeholder_bytes = await _generate_placeholder_images(7)
+        placeholder_labels = ["2D Blueprint", "3D Exterior", "Top-Down View", "Living Room", "Master Bedroom", "Kitchen", "Bathroom"]
+        yield {"type": "master_prompt", "prompt": "Dev Mode Prompt"}
+        for i, b in enumerate(placeholder_bytes):
+            yield {"type": "image", "label": placeholder_labels[i], "bytes": b}
+        return
+
+    views_to_generate = get_views_to_generate(property_type)
+    labels = get_view_labels()
+    
+    # Generate a unified design seed to anchor visual identity across all views
+    import random
+    design_seed = random.randint(1, 1000000)
+    
+    # Send the initial list of views to the frontend so it can build the UI list
+    view_list = [{"key": v, "label": labels[v]} for v in views_to_generate]
+    yield {"type": "view_list", "views": view_list}
+
+    try:
+        client = genai.Client(api_key=api_key)
+    except Exception as e:
+        yield {"type": "error", "message": f"Failed to initialize AI client: {str(e)}"}
+        return
+
+    async def generate_gemini_image(prompt_text: str) -> Optional[bytes]:
+        try:
+            def call_imagen():
+                return client.models.generate_images(
+                    model="imagen-4.0-generate-001",
+                    prompt=prompt_text,
+                    config=types.GenerateImagesConfig(
+                        number_of_images=1,
+                        output_mime_type="image/png",
+                        aspect_ratio="16:9",
+                        seed=design_seed
+                    )
+                )
+
+            response = await asyncio.to_thread(call_imagen)
+            if response.generated_images:
+                return response.generated_images[0].image.image_bytes
+            return None
+        except Exception as e:
+            print(f"❌ Gemini (New SDK) Error: {e}")
+            return None
+
+    for i, view in enumerate(views_to_generate):
+        prompt = build_prompt(
+            property_type, num_rooms, land_size, architectural_style, view, additional_preferences
+        )
+        if i == 0: 
+            yield {"type": "master_prompt", "prompt": prompt}
+        
+        yield {"type": "view_start", "view_key": view, "label": labels[view]}
+        yield {"type": "progress", "message": f"🎨 Generating {labels[view]} via Gemini..."}
+        
+        img_bytes = await generate_gemini_image(prompt)
+        
+        if img_bytes:
+            yield {"type": "view_complete", "view_key": view, "label": labels[view]}
+            yield {"type": "image", "label": labels[view], "bytes": img_bytes}
+        else:
+            yield {"type": "view_error", "view_key": view, "label": labels[view]}
+            yield {"type": "progress", "message": f"❌ Failed to generate {labels[view]}."}
+
 
 
 async def generate_single_view(
