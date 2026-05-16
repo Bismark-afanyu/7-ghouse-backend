@@ -95,12 +95,16 @@ async def _execute_generation_query(query) -> list[dict]:
     return results
 
 
-async def update_generation(generation_id: str, user_id: str, updates: dict) -> bool:
+async def update_generation(generation_id: str, user_id: str, updates: dict, is_admin: bool = False) -> bool:
     """Update a specific generation record."""
     db = _get_db()
     doc_ref = db.collection("generations").document(generation_id)
     doc = doc_ref.get()
-    if not doc.exists or doc.to_dict().get("user_id") != user_id:
+    if not doc.exists:
+        return False
+    
+    data = doc.to_dict()
+    if not is_admin and data.get("user_id") != user_id:
         return False
     
     # We only allow updating specific fields, e.g., client_name
@@ -113,12 +117,16 @@ async def update_generation(generation_id: str, user_id: str, updates: dict) -> 
     return True
 
 
-async def delete_generation(generation_id: str, user_id: str) -> bool:
+async def delete_generation(generation_id: str, user_id: str, is_admin: bool = False) -> bool:
     """Delete a specific generation record."""
     db = _get_db()
     doc_ref = db.collection("generations").document(generation_id)
     doc = doc_ref.get()
-    if not doc.exists or doc.to_dict().get("user_id") != user_id:
+    if not doc.exists:
+        return False
+    
+    data = doc.to_dict()
+    if not is_admin and data.get("user_id") != user_id:
         return False
     
     doc_ref.delete()

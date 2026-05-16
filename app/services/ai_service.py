@@ -220,7 +220,7 @@ async def generate_images(
         )
         if i == 0: master_prompt = prompt
         
-        print(f"🎨 Generating {view} via Gemini (Imagen 4.0)...")
+        print(f" Generating {view} via Gemini (Imagen 4.0)...")
         img_bytes = await generate_gemini_image(prompt)
         
         if img_bytes:
@@ -256,9 +256,7 @@ async def generate_images_stream(
     views_to_generate = get_views_to_generate(property_type)
     labels = get_view_labels()
     
-    # Generate a unified design seed to anchor visual identity across all views
-    import random
-    design_seed = random.randint(1, 1000000)
+    # Note: unified design seed removed as it's not supported in Gemini Developer API mode
     
     # Send the initial list of views to the frontend so it can build the UI list
     view_list = [{"key": v, "label": labels[v]} for v in views_to_generate]
@@ -279,8 +277,7 @@ async def generate_images_stream(
                     config=types.GenerateImagesConfig(
                         number_of_images=1,
                         output_mime_type="image/png",
-                        aspect_ratio="16:9",
-                        seed=design_seed
+                        aspect_ratio="16:9"
                     )
                 )
 
@@ -348,7 +345,7 @@ async def generate_single_view(
                 )
             )
 
-        print(f"🎨 Regenerating {view_type} via Gemini (Imagen 4.0)...")
+        print(f"Regenerating {view_type} via Gemini (Imagen 4.0)...")
         response = await asyncio.to_thread(call_imagen)
         
         if response.generated_images:

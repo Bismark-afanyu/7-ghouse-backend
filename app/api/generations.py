@@ -232,8 +232,9 @@ async def get_generation(generation_id: str, user=Depends(verify_token)):
 async def update_generation_endpoint(generation_id: str, request: GenerationUpdate, user=Depends(verify_token)):
     """Update a generation (e.g. client name)."""
     user_id = user["uid"]
+    is_admin = user.get("role") == "admin"
     try:
-        success = await db_service.update_generation(generation_id, user_id, request.dict(exclude_unset=True))
+        success = await db_service.update_generation(generation_id, user_id, request.dict(exclude_unset=True), is_admin=is_admin)
         if not success:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -253,8 +254,9 @@ async def update_generation_endpoint(generation_id: str, request: GenerationUpda
 async def delete_generation_endpoint(generation_id: str, user=Depends(verify_token)):
     """Delete a generation."""
     user_id = user["uid"]
+    is_admin = user.get("role") == "admin"
     try:
-        success = await db_service.delete_generation(generation_id, user_id)
+        success = await db_service.delete_generation(generation_id, user_id, is_admin=is_admin)
         if not success:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
