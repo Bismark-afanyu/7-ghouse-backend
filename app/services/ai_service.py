@@ -69,21 +69,28 @@ def build_prompt(
     
     prompts = {
         "floor_plans_composite": (
-            f"A professional architectural floor plan sheet for a {base_info}. "
-            "Composite layout showing ALL floor plans in one clean architectural drawing. "
-            "Include BASEMENT (if applicable), GROUND FLOOR, and UPPER FLOOR plans arranged vertically with labels. "
-            "Black and white technical blueprint style, clean lines, precise room labels with names, "
-            "dimension lines with measurements, door and window symbols, staircase indicators. "
-            "Professional architectural documentation standard, high contrast, no color, no rendering."
+            f"A professional architectural 2D floor plan drawing sheet for a {base_info}. "
+            "Composite sheet layout showing all floor plans in one clean, elegant architectural document. "
+            "Include BASEMENT (if applicable), GROUND FLOOR, and UPPER FLOOR plans arranged vertically. "
+            "Style: Clean fine black vector-style linework on a solid, pure white background. "
+            "Zero color, zero gray fills, zero realistic rendering, zero shading or shadow gradients, zero paper textures, and zero blue grids. "
+            "Precise thin black line drawings of rooms, wall thicknesses, door swing symbols, window cutouts, staircases, and simple furniture shapes. "
+            "Each plan is labeled with centered bold all-caps text: 'GROUND FLOOR PLAN', 'FIRST FLOOR PLAN', etc. "
+            "Professional architectural CAD/Revit export quality, minimal, high-contrast, clean blueprint lines."
         ),
         "elevations_composite": (
-            f"A professional architectural elevation sheet for a {base_info}. "
-            "Composite layout showing ALL FOUR exterior elevations in one clean architectural drawing: "
+            f"A professional architectural elevation sheet showing exterior elevations of a {base_info}. "
+            "It is a composite layout consisting of exactly four orthographic flat 2D elevation drawings: "
             "FRONT ELEVATION (top-left), REAR ELEVATION (top-right), "
-            "LEFT SIDE ELEVATION (bottom-left), RIGHT SIDE ELEVATION (bottom-right). "
-            "Each elevation must show the exact same building with consistent roofline, proportions, and materials. "
-            "Black and white technical elevation style, clean lines, height annotations, ground line, "
-            f"roof profile, window and door placements. {master_seed} Architectural documentation standard."
+            "LEFT ELEVATION (bottom-left), RIGHT ELEVATION (bottom-right). "
+            "Layout structure: Organized in a 2x2 grid divided by thin grey vertical and horizontal divider lines on a solid pure white background. "
+            "Style: Pure black-and-white clean vector-style technical line-art drawing. "
+            "CRITICAL: Zero color, zero gray fills, zero shading, zero shadows, zero rendering gradients, zero paper textures, and zero blue grids. "
+            "Every line is a fine, clean, high-contrast crisp black outline stroke (Revit/CAD export style). "
+            "Centered below each elevation, include a bold all-caps text label: 'FRONT ELEVATION', 'REAR ELEVATION', 'LEFT ELEVATION', 'RIGHT ELEVATION'. "
+            "Show structural details purely as clean line-drawing patterns: vertical lines for vertical board-and-batten siding, "
+            "parallel horizontal lines for horizontal lap siding, clean fine outlines for brick/stone veneer patterns, and parallel rows for roof shingles. "
+            "No landscape elements, no sky, no trees, no grass, no people, and no background shadows. Pure crisp line-drawing only."
         ),
         "exterior_3d_composite": (
             f"A premium photorealistic 3D exterior rendering composite of a {base_info}. "
@@ -181,7 +188,12 @@ async def generate_images_stream(
     architectural_style: str,
     additional_preferences: Optional[str] = None,
     is_multi_story: bool = False,
+    cancel_event: Optional[asyncio.Event] = None,
 ):
+    if cancel_event and cancel_event.is_set():
+        yield {"type": "cancelled"}
+        return
+
     api_key = settings.GEMINI_API_KEY
     if not api_key:
         yield {"type": "progress", "message": "Development Mode: Mocking images..."}
@@ -189,6 +201,9 @@ async def generate_images_stream(
         placeholder_labels = ["2D Blueprint", "3D Exterior", "Top-Down View", "Living Room", "Master Bedroom", "Kitchen", "Bathroom"]
         yield {"type": "master_prompt", "prompt": "Dev Mode Prompt"}
         for i, b in enumerate(placeholder_bytes):
+            if cancel_event and cancel_event.is_set():
+                yield {"type": "cancelled"}
+                return
             yield {"type": "image", "label": placeholder_labels[i], "bytes": b}
         return
 
@@ -225,6 +240,10 @@ async def generate_images_stream(
             return None
 
     for i, view in enumerate(views_to_generate):
+        if cancel_event and cancel_event.is_set():
+            yield {"type": "cancelled"}
+            return
+
         prompt = build_prompt(
             property_type, num_rooms, land_size, architectural_style, view, additional_preferences
         )
@@ -235,6 +254,10 @@ async def generate_images_stream(
         yield {"type": "progress", "message": f"Generating {labels[view]} via Gemini..."}
         
         img_bytes = await generate_gemini_image(prompt)
+
+        if cancel_event and cancel_event.is_set():
+            yield {"type": "cancelled"}
+            return
         
         if img_bytes:
             yield {"type": "view_complete", "view_key": view, "label": labels[view]}

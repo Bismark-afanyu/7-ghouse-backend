@@ -6,10 +6,22 @@ from app.services import ai_service, storage_service
 from app.repositories import generation_repository as db_service
 import uuid
 import os
+import asyncio
 from typing import Optional
 from typing import List
 
 router = APIRouter()
+
+_cancel_events: dict[str, asyncio.Event] = {}
+
+
+@router.post("/generate/cancel")
+async def cancel_generation(request: dict, user=Depends(verify_token)):
+    generation_id = request.get("generation_id")
+    if generation_id and generation_id in _cancel_events:
+        _cancel_events[generation_id].set()
+        return {"status": "cancelled"}
+    return {"status": "not_found"}
 
 
 import json
@@ -73,16 +85,28 @@ async def generate_design(request: GenerationRequest, user=Depends(verify_token)
     user_id = user["uid"]
 
     async def event_generator():
+        cancel_event = asyncio.Event()
+        generation_id = uuid.uuid4().hex
+        _cancel_events[generation_id] = cancel_event
         try:
-            generation_id = uuid.uuid4().hex
             uploaded_images = []
             prompt_used = ""
             idx = 0
+
+            yield f"data: {json.dumps({'status': 'generation_id', 'generation_id': generation_id})}\n\n"
+
+            if cancel_event.is_set():
+                yield f"data: {json.dumps({'status': 'cancelled'})}\n\n"
+                return
 
             yield f"data: {json.dumps({'status': 'progress', 'message': 'Initializing AI engines...'})}\n\n"
 
             # Build comprehensive prompt from structured fields
             enriched_prompt = _build_house_plan_prompt(request)
+
+            if cancel_event.is_set():
+                yield f"data: {json.dumps({'status': 'cancelled'})}\n\n"
+                return
 
             async for event in ai_service.generate_images_stream(
                 property_type=f"{request.house_style} Residence",
@@ -91,11 +115,16 @@ async def generate_design(request: GenerationRequest, user=Depends(verify_token)
                 architectural_style=request.house_style,
                 additional_preferences=enriched_prompt,
                 is_multi_story=request.is_multi_story,
+                cancel_event=cancel_event,
             ):
                 if event["type"] in ["progress", "view_list", "view_start", "view_complete", "view_error", "error"]:
                     yield f"data: {json.dumps({'status': event['type'], **event})}\n\n"
                     if event["type"] == "error":
                         return
+                
+                elif event["type"] == "cancelled":
+                    yield f"data: {json.dumps({'status': 'cancelled'})}\n\n"
+                    return
                 
                 elif event["type"] == "master_prompt":
                     prompt_used = event["prompt"]
@@ -103,6 +132,10 @@ async def generate_design(request: GenerationRequest, user=Depends(verify_token)
                 elif event["type"] == "image":
                     label_str = event["label"]
                     yield f"data: {json.dumps({'status': 'progress', 'message': f'Uploading {label_str}...'})}\n\n"
+
+                    if cancel_event.is_set():
+                        yield f"data: {json.dumps({'status': 'cancelled'})}\n\n"
+                        return
                     
                     img_data = await storage_service.upload_image(
                         image_bytes=event["bytes"],
@@ -145,6 +178,8 @@ async def generate_design(request: GenerationRequest, user=Depends(verify_token)
         except Exception as e:
             error_payload = {"status": "error", "detail": f"Generation failed: {str(e)}"}
             yield f"data: {json.dumps(error_payload)}\n\n"
+        finally:
+            _cancel_events.pop(generation_id, None)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
@@ -411,11 +446,19 @@ async def generate_floor_plan(request: FloorPlanRequest, user=Depends(verify_tok
     user_id = user["uid"]
 
     async def event_generator():
+        cancel_event = asyncio.Event()
+        generation_id = uuid.uuid4().hex
+        _cancel_events[generation_id] = cancel_event
         try:
-            generation_id = uuid.uuid4().hex
             uploaded_images = []
             prompt_used = ""
             idx = 0
+
+            yield f"data: {json.dumps({'status': 'generation_id', 'generation_id': generation_id})}\n\n"
+
+            if cancel_event.is_set():
+                yield f"data: {json.dumps({'status': 'cancelled'})}\n\n"
+                return
 
             yield f"data: {json.dumps({'status': 'progress', 'message': 'Initializing floor plan engine...'})}\n\n"
 
@@ -445,10 +488,11 @@ async def generate_floor_plan(request: FloorPlanRequest, user=Depends(verify_tok
                 f"{extras_desc} "
                 f"{region_context} "
                 f"{request.additional_preferences or ''} "
-                f"Show a clean, detailed architectural floor plan with labeled rooms, dimensions, "
-                f"door and window placements, and furniture layout. "
-                f"Professional blueprint style, black and white technical drawing with precise lines, "
-                f"architectural scale markers, and room labels. High quality, detailed, no text outside labels."
+                "Style: Clean fine black vector-style linework on a solid, pure white background. "
+                "CRITICAL: Zero color, zero gray fills, zero realistic rendering, zero shading, and zero paper textures or blue grids. "
+                "Every line is a fine, clean, high-contrast crisp black outline stroke (CAD/Revit export style). "
+                "Show detailed room layouts, wall thicknesses, door swings, window placements, simple line-based furniture outlines, and room labels. "
+                "High quality technical architectural drawing standard, neat lines, no text outside labels."
             )
 
             prompt_used = prompt
@@ -461,22 +505,39 @@ async def generate_floor_plan(request: FloorPlanRequest, user=Depends(verify_tok
             yield f"data: {json.dumps({'status': 'view_list', 'views': views})}\n\n"
 
             for i, view in enumerate(views):
+                if cancel_event.is_set():
+                    yield f"data: {json.dumps({'status': 'cancelled'})}\n\n"
+                    return
+
                 view_key = view["key"]
                 view_label = view["label"]
 
                 yield f"data: {json.dumps({'status': 'view_start', 'view_key': view_key, 'label': view_label})}\n\n"
                 yield f"data: {json.dumps({'status': 'progress', 'message': f'Generating {view_label}...'})}\n\n"
 
+                if cancel_event.is_set():
+                    yield f"data: {json.dumps({'status': 'cancelled'})}\n\n"
+                    return
+
                 view_prompt = prompt
                 if view_key == "floor_plan_annotated":
-                    view_prompt = prompt + " Add precise dimension lines, measurement labels in meters, room area labels, and a north arrow. Professional architectural construction document style."
+                    view_prompt = prompt + " Add precise thin black dimension lines, measurement labels in meters, room area labels, and a clean north arrow. Professional technical construction document style."
                 elif view_key == "floor_plan_3d":
                     view_prompt = prompt + " Show as a 3D isometric/perspective cutaway view of the floor plan, with color-coded rooms, 3D furniture, and realistic materials. Warm inviting style."
 
                 img_bytes = await ai_service.generate_floor_plan_image(view_prompt)
 
+                if cancel_event.is_set():
+                    yield f"data: {json.dumps({'status': 'cancelled'})}\n\n"
+                    return
+
                 if img_bytes:
                     yield f"data: {json.dumps({'status': 'progress', 'message': f'Uploading {view_label}...'})}\n\n"
+
+                    if cancel_event.is_set():
+                        yield f"data: {json.dumps({'status': 'cancelled'})}\n\n"
+                        return
+
                     img_data = await storage_service.upload_image(
                         image_bytes=img_bytes,
                         user_id=user_id,
@@ -512,6 +573,8 @@ async def generate_floor_plan(request: FloorPlanRequest, user=Depends(verify_tok
         except Exception as e:
             error_payload = {"status": "error", "detail": f"Floor plan generation failed: {str(e)}"}
             yield f"data: {json.dumps(error_payload)}\n\n"
+        finally:
+            _cancel_events.pop(generation_id, None)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
