@@ -1,8 +1,8 @@
 from fastapi import APIRouter, Depends, HTTPException, status, File, UploadFile
 from app.core.auth_middleware import verify_token, require_admin
 from app.repositories import user_repository
+from app.db.firebase import bucket
 import os
-import shutil
 from pydantic import BaseModel
 from typing import Optional
 
@@ -26,27 +26,17 @@ async def get_me(user=Depends(verify_token)):
 
 @router.post("/me/avatar")
 async def upload_avatar(file: UploadFile = File(...), user=Depends(verify_token)):
-    """Upload a profile picture to local storage."""
-    # Create avatars directory
-    avatar_dir = os.path.join("static", "avatars")
-    if not os.path.exists(avatar_dir):
-        os.makedirs(avatar_dir)
-        
-    # Generate filename
+    if bucket is None:
+        raise HTTPException(status_code=500, detail="Firebase Storage not initialized")
+
     ext = os.path.splitext(file.filename)[1]
     filename = f"{user['uid']}{ext}"
-    file_path = os.path.join(avatar_dir, filename)
-    
-    # Save file
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-        
-    # URL to access the file
-    avatar_url = f"/static/avatars/{filename}"
-    
-    # Update Firestore instead of Firebase Auth (which rejects relative URLs)
+    blob_path = f"avatars/{filename}"
+    blob = bucket.blob(blob_path)
+    blob.upload_from_file(file.file, content_type=file.content_type or "image/jpeg")
+    blob.make_public()
+    avatar_url = blob.public_url
     await user_repository.update_user(user['uid'], {"photo_url": avatar_url})
-    
     return {"avatar_url": avatar_url}
 
 @router.get("/", dependencies=[Depends(require_admin)])

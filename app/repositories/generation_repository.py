@@ -1,5 +1,8 @@
 from datetime import datetime, timezone
 from typing import Optional
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def _get_db():
@@ -25,6 +28,7 @@ async def save_floor_plan_generation(
         "land_size": f"{specification.get('gross_area', '0')} m²",
         "architectural_style": "N/A",
         "region": specification.get("region", "Center"),
+        "division": specification.get("division", ""),
         "construction_standard": "Standard Modern",
         "additional_preferences": None,
         "prompt_used": prompt_used,
@@ -52,6 +56,7 @@ async def save_generation(
     kitchen_type: str = "",
     key_rooms: Optional[list[str]] = None,
     region: str = "Center",
+    division: str = "",
     additional_preferences: Optional[str] = None,
     prompt_used: str = "",
     images: Optional[list[dict]] = None,
@@ -76,6 +81,7 @@ async def save_generation(
         "kitchen_type": kitchen_type,
         "key_rooms": key_rooms or [],
         "region": region or "Center",
+        "division": division,
         "additional_preferences": additional_preferences,
         "prompt_used": prompt_used,
         "images": images or [],
@@ -139,9 +145,12 @@ async def _execute_generation_query(query) -> list[dict]:
             "gross_area": gross_area,
             "num_bedrooms": num_bedrooms,
             "region": data.get("region", "Center"),
+            "division": data.get("division", ""),
             "thumbnail_url": images[0]["url"] if images else None,
             "image_count": len(images),
             "created_at": data.get("created_at", ""),
+            "pdf_url": data.get("telegram_pdf_url", ""),
+            "pdf_generated_at": data.get("pdf_generated_at", ""),
         })
     return results
 
@@ -191,6 +200,72 @@ async def get_generation_by_share_token(share_token: str) -> Optional[dict]:
         data = doc.to_dict()
         return {"id": doc.id, **data}
     return None
+
+
+async def get_generation_by_id_for_telegram(generation_id: str) -> Optional[dict]:
+    db = _get_db()
+    doc_ref = db.collection("generations").document(generation_id)
+    doc = doc_ref.get()
+    if not doc.exists:
+        return None
+    data = doc.to_dict()
+    images = [
+        {"url": img.get("url"), "label": img.get("label")}
+        for img in data.get("images", [])
+    ]
+    return {
+        "images": images,
+        "floor_plan_spec": data.get("floor_plan_spec", {}),
+        "telegram_pdf_url": data.get("telegram_pdf_url", ""),
+        "video_url": data.get("video_url", ""),
+    }
+
+
+async def get_generation_by_id_full(generation_id: str) -> Optional[dict]:
+    """Return the complete generation document, used by the PDF service."""
+    db = _get_db()
+    doc_ref = db.collection("generations").document(generation_id)
+    doc = doc_ref.get()
+    if not doc.exists:
+        return None
+    data = doc.to_dict()
+    return {"id": doc.id, **data}
+
+
+async def set_telegram_pdf_url(generation_id: str, pdf_url: str) -> bool:
+    db = _get_db()
+    try:
+        db.collection("generations").document(generation_id).update({
+            "telegram_pdf_url": pdf_url,
+            "pdf_generated_at": datetime.now(timezone.utc).isoformat(),
+        })
+        return True
+    except Exception as e:
+        logger.error(f"Failed to set telegram_pdf_url: {e}")
+        return False
+
+
+async def delete_generation_pdf(generation_id: str) -> bool:
+    db = _get_db()
+    try:
+        db.collection("generations").document(generation_id).update({
+            "telegram_pdf_url": None,
+            "pdf_generated_at": None,
+        })
+        return True
+    except Exception as e:
+        logger.error(f"Failed to delete generation pdf: {e}")
+        return False
+
+
+async def set_video_url(generation_id: str, video_url: str) -> bool:
+    db = _get_db()
+    try:
+        db.collection("generations").document(generation_id).update({"video_url": video_url, "video_status": "done"})
+        return True
+    except Exception as e:
+        print(f"Failed to set video_url: {e}")
+        return False
 
 
 async def delete_generation(generation_id: str, user_id: str, is_admin: bool = False) -> bool:

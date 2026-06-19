@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
     NANO_BANANA_API_KEY: str = os.getenv("NANO_BANANA_API_KEY", "")
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+    FAL_API_KEY: str = os.getenv("FAL_API_KEY", "")
 
     class Config:
         env_file = ".env"

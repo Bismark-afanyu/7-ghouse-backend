@@ -1,9 +1,27 @@
-from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi.responses import StreamingResponse, Response
 from app.core.auth_middleware import verify_token
-from app.schemas.generation import GenerationRequest, GenerationResponse, GenerationHistoryItem, WorkspaceResponse, SingleRoomRequest, SaveGenerationRequest, GenerationImage, GenerationUpdate, FloorPlanRequest, FloorPlanWorkspaceResponse, FloorPlanSpecification, SingleFloorPlanViewRequest, SaveFloorPlanRequest
+from app.schemas.generation import GenerationRequest, GenerationResponse, GenerationHistoryItem, WorkspaceResponse, SingleRoomRequest, SaveGenerationRequest, GenerationImage, GenerationUpdate, FloorPlanRequest, FloorPlanWorkspaceResponse, FloorPlanSpecification, SingleFloorPlanViewRequest, SaveFloorPlanRequest, CleanupRequest
 from app.services import ai_service, storage_service
+from app.services.floor_plan_layout import generate_floor_plan_layout
+from app.services.floor_plan_ai import render_floor_plan_ai as render_floor_plan
+from app.services.elevation_renderer import render_elevations
+from app.services.cross_section_renderer import render_cross_section
+from app.services.three_d_renderer import render_3d_wireframe
+from app.services.roof_plan_renderer import render_roof_plan
 from app.repositories import generation_repository as db_service
+import logging
+
+logger = logging.getLogger(__name__)
+
+_FLOOR_PLAN_VIEW_RENDERERS = {
+    "floor_plan_main": lambda l: render_floor_plan(l, annotated=False),
+    "floor_plan_annotated": lambda l: render_floor_plan(l, annotated=True),
+    "elevations_composite": lambda l: asyncio.to_thread(render_elevations, l),
+    "cross_section_view": lambda l: asyncio.to_thread(render_cross_section, l),
+    "roof_plan_view": lambda l: asyncio.to_thread(render_roof_plan, l),
+    "floor_plan_3d": lambda l: asyncio.to_thread(render_3d_wireframe, l),
+}
 import uuid
 import os
 import asyncio
@@ -61,14 +79,20 @@ def _build_house_plan_prompt(
 
     # Cameroon Region Context
     region_contexts = {
-        "Douala": "Optimized for Douala's coastal wet/clay soil: elevated foundation, high cross-ventilation, wide verandas.",
-        "Yaoundé": "Tailored for Yaoundé's steep sloped/rocky terrain: multi-level layout, stone retaining walls, stepped design.",
-        "Coastal": "Designed for the coastal flood-risk zone: elevated concrete structure, flood-safe ground clearance, large shaded areas.",
+        "Littoral": "Optimized for Douala's coastal wet/clay soil: elevated foundation, high cross-ventilation, wide verandas.",
+        "Centre": "Tailored for Yaoundé's steep sloped/rocky terrain: multi-level layout, stone retaining walls, stepped design.",
         "West": "Adapted for Western Highlands: deep roof overhangs, robust surface drainage, slope-stabilized foundation.",
         "North": "Designed for Sahel hot-arid climate: high thermal mass walls, high ceilings, small shaded openings, cross-ventilation.",
-        "Center": "Standard design for stable laterite soil: clean modern layout with good cross-ventilation and natural light.",
+        "Adamaoua": "Designed for Adamaoua highland savannah: good cross-ventilation, sun-shading, robust rainwater harvesting.",
+        "North-West": "Designed for North-West mountainous terrain: slope-adapted foundation, reinforced retaining walls, deep drainage.",
+        "South": "Designed for South Cameroon dense rainforest: high-pitched roof, extensive covered areas, anti-mold ventilation.",
+        "East": "Designed for East region forest-savannah transition: raised foundation, wide verandas, termite-resistant materials.",
+        "Far North": "Designed for Far North extreme arid Sahel: high thermal mass, compact layout, shaded courtyard, minimal glazing.",
+        "South-West": "Optimized for South-West volcanic/coastal zone: elevated structure, flood-safe ground clearance, corrosion-resistant fixtures.",
     }
-    region_ctx = region_contexts.get(request.region, "")
+    _legacy_map = {"Douala": "Littoral", "Yaoundé": "Centre", "Coastal": "South-West", "Center": "Centre"}
+    mapped_region = _legacy_map.get(request.region, request.region)
+    region_ctx = region_contexts.get(mapped_region, "")
     if region_ctx:
         parts.append(region_ctx)
 
@@ -99,7 +123,7 @@ async def generate_design(request: GenerationRequest, user=Depends(verify_token)
                 yield f"data: {json.dumps({'status': 'cancelled'})}\n\n"
                 return
 
-            yield f"data: {json.dumps({'status': 'progress', 'message': 'Initializing AI engines...'})}\n\n"
+            yield f"data: {json.dumps({'status': 'progress', 'progress_type': 'initializing'})}\n\n"
 
             # Build comprehensive prompt from structured fields
             enriched_prompt = _build_house_plan_prompt(request)
@@ -108,6 +132,15 @@ async def generate_design(request: GenerationRequest, user=Depends(verify_token)
                 yield f"data: {json.dumps({'status': 'cancelled'})}\n\n"
                 return
 
+            # Generate programmatic layout first
+            layout = await generate_floor_plan_layout(
+                num_bedrooms=request.num_bedrooms,
+                num_bathrooms=int(request.num_bathrooms),
+                kitchen_type=request.kitchen_type,
+                extras=request.key_rooms + request.outdoor_spaces,
+                gross_area=request.gross_area,
+            )
+
             async for event in ai_service.generate_images_stream(
                 property_type=f"{request.house_style} Residence",
                 num_rooms=request.num_bedrooms,
@@ -115,9 +148,52 @@ async def generate_design(request: GenerationRequest, user=Depends(verify_token)
                 architectural_style=request.house_style,
                 additional_preferences=enriched_prompt,
                 is_multi_story=request.is_multi_story,
+                num_stories=request.num_stories or 1,
+                roof_type=request.roof_type,
                 cancel_event=cancel_event,
+                overlay_language="en",
+                num_bathrooms=int(request.num_bathrooms),
+                kitchen_type=request.kitchen_type,
+                key_rooms=request.key_rooms,
+                outdoor_spaces=request.outdoor_spaces,
             ):
-                if event["type"] in ["progress", "view_list", "view_start", "view_complete", "view_error", "error"]:
+                if event["type"] == "view_list":
+                    views = event.get("views", [])
+                    views.insert(0, {"key": "floor_plans_composite", "label": "Floor Plans"})
+                    yield f"data: {json.dumps({'status': 'view_list', 'views': views})}\n\n"
+
+                    yield f"data: {json.dumps({'status': 'view_start', 'view_key': 'floor_plans_composite', 'label': 'Floor Plans'})}\n\n"
+                    yield f"data: {json.dumps({'status': 'progress', 'progress_type': 'generating', 'label': 'Floor Plans'})}\n\n"
+
+                    img_bytes = await render_floor_plan(layout, True)
+                    
+                    if cancel_event.is_set():
+                        yield f"data: {json.dumps({'status': 'cancelled'})}\n\n"
+                        return
+
+                    if not img_bytes:
+                        yield f"data: {json.dumps({'status': 'view_error', 'view_key': 'floor_plans_composite', 'error': 'Floor plan generation failed'})}\n\n"
+                    else:
+                        yield f"data: {json.dumps({'status': 'progress', 'progress_type': 'uploading', 'label': 'Floor Plans'})}\n\n"
+                        
+                        img_data = await storage_service.upload_image(
+                            image_bytes=img_bytes,
+                            user_id=user_id,
+                            generation_id=generation_id,
+                            index=idx,
+                        )
+                        idx += 1
+                        
+                        uploaded_images.append({
+                            "url": img_data["url"],
+                            "storage_path": img_data["storage_path"],
+                            "label": "Floor Plans",
+                            "view_key": "floor_plans_composite"
+                        })
+                        
+                        yield f"data: {json.dumps({'status': 'view_complete', 'view_key': 'floor_plans_composite', 'label': 'Floor Plans'})}\n\n"
+
+                elif event["type"] in ["progress", "view_start", "view_complete", "view_error", "error"]:
                     yield f"data: {json.dumps({'status': event['type'], **event})}\n\n"
                     if event["type"] == "error":
                         return
@@ -131,7 +207,7 @@ async def generate_design(request: GenerationRequest, user=Depends(verify_token)
                 
                 elif event["type"] == "image":
                     label_str = event["label"]
-                    yield f"data: {json.dumps({'status': 'progress', 'message': f'Uploading {label_str}...'})}\n\n"
+                    yield f"data: {json.dumps({'status': 'progress', 'progress_type': 'uploading', 'label': label_str})}\n\n"
 
                     if cancel_event.is_set():
                         yield f"data: {json.dumps({'status': 'cancelled'})}\n\n"
@@ -170,6 +246,7 @@ async def generate_design(request: GenerationRequest, user=Depends(verify_token)
                     "kitchen_type": request.kitchen_type,
                     "key_rooms": request.key_rooms,
                     "region": request.region,
+                    "division": request.division,
                     "additional_preferences": request.additional_preferences,
                 },
             }
@@ -185,23 +262,54 @@ async def generate_design(request: GenerationRequest, user=Depends(verify_token)
 
 
 
+@router.post("/generate/cleanup")
+async def cleanup_images(request: CleanupRequest, user=Depends(verify_token)):
+    """Delete uploaded images from storage when user cancels without saving."""
+    deleted = 0
+    failed = 0
+    for path in request.storage_paths:
+        success = await storage_service.delete_image(path)
+        if success:
+            deleted += 1
+        else:
+            failed += 1
+    return {"status": "success", "deleted": deleted, "failed": failed}
+
+
 @router.post("/generate/room", response_model=GenerationImage)
 async def generate_single_room(request: SingleRoomRequest, user=Depends(verify_token)):
     """Regenerate a single specific view."""
     user_id = user["uid"]
     
     try:
-        enriched_prompt = _build_single_room_prompt(request)
-
-        img_bytes = await ai_service.generate_single_view(
-            property_type=f"{request.house_style} Residence",
-            num_rooms=request.num_bedrooms,
-            land_size=f"{request.gross_area} m²",
-            architectural_style=request.house_style,
-            view_type=request.view_type,
-            additional_preferences=enriched_prompt,
-        )
-        
+        if request.view_type == "floor_plans_composite":
+            layout = await generate_floor_plan_layout(
+                num_bedrooms=request.num_bedrooms,
+                num_bathrooms=int(request.num_bathrooms),
+                kitchen_type=request.kitchen_type,
+                extras=request.key_rooms + request.outdoor_spaces,
+                gross_area=request.gross_area,
+            )
+            img_bytes = await render_floor_plan(layout, True)
+        else:
+            enriched_prompt = _build_single_room_prompt(request)
+    
+            img_bytes = await ai_service.generate_single_view(
+                property_type=f"{request.house_style} Residence",
+                num_rooms=request.num_bedrooms,
+                land_size=f"{request.gross_area} m²",
+                architectural_style=request.house_style,
+                view_type=request.view_type,
+                additional_preferences=enriched_prompt,
+                num_stories=request.num_stories or 1,
+                roof_type=request.roof_type,
+                overlay_language="en",
+                num_bathrooms=int(request.num_bathrooms),
+                kitchen_type=request.kitchen_type,
+                key_rooms=request.key_rooms,
+                outdoor_spaces=request.outdoor_spaces,
+            )
+            
         if not img_bytes:
             raise Exception("AI failed to generate image.")
 
@@ -269,6 +377,7 @@ async def save_generation(request: SaveGenerationRequest, user=Depends(verify_to
             kitchen_type=request.kitchen_type,
             key_rooms=request.key_rooms,
             region=request.region,
+            division=request.division,
             additional_preferences=request.additional_preferences,
             prompt_used=request.prompt_used,
             images=images_dict,
@@ -291,6 +400,7 @@ async def save_generation(request: SaveGenerationRequest, user=Depends(verify_to
             kitchen_type=request.kitchen_type,
             key_rooms=request.key_rooms,
             region=request.region,
+            division=request.division,
             additional_preferences=request.additional_preferences,
             images=request.images,
             prompt_used=request.prompt_used,
@@ -356,12 +466,15 @@ async def get_generation(generation_id: str, user=Depends(verify_token)):
                 "num_rooms": result.get("num_rooms", 0),
                 "land_size": result.get("land_size", ""),
                 "region": result.get("region", "Center"),
+                "division": result.get("division", ""),
                 "construction_standard": result.get("construction_standard", "Standard Modern"),
                 "images": result.get("images", []),
                 "prompt_used": result.get("prompt_used", ""),
                 "created_at": result.get("created_at", ""),
                 "user_id": result.get("user_id", user_id),
                 "floor_plan_spec": spec,
+                "pdf_url": result.get("telegram_pdf_url", ""),
+                "pdf_generated_at": result.get("pdf_generated_at", ""),
             }
         
         return {
@@ -382,11 +495,14 @@ async def get_generation(generation_id: str, user=Depends(verify_token)):
             "kitchen_type": result.get("kitchen_type", ""),
             "key_rooms": result.get("key_rooms", []),
             "region": result.get("region", "Center"),
+            "division": result.get("division", ""),
             "additional_preferences": result.get("additional_preferences"),
             "images": result.get("images", []),
             "prompt_used": result.get("prompt_used", ""),
             "created_at": result.get("created_at", ""),
             "user_id": result.get("user_id", user_id),
+            "pdf_url": result.get("telegram_pdf_url", ""),
+            "pdf_generated_at": result.get("pdf_generated_at", ""),
         }
     except HTTPException:
         raise
@@ -423,6 +539,16 @@ async def delete_generation_endpoint(generation_id: str, user=Depends(verify_tok
     user_id = user["uid"]
     is_admin = user.get("role") == "admin"
     try:
+        gen = await db_service.get_generation(generation_id, user_id, is_admin=is_admin)
+        if not gen:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Generation not found or access denied",
+            )
+        for img in gen.get("images", []):
+            storage_path = img.get("storage_path")
+            if storage_path:
+                await storage_service.delete_image(storage_path)
         success = await db_service.delete_generation(generation_id, user_id, is_admin=is_admin)
         if not success:
             raise HTTPException(
@@ -460,46 +586,62 @@ async def generate_floor_plan(request: FloorPlanRequest, user=Depends(verify_tok
                 yield f"data: {json.dumps({'status': 'cancelled'})}\n\n"
                 return
 
-            yield f"data: {json.dumps({'status': 'progress', 'message': 'Initializing floor plan engine...'})}\n\n"
+            yield f"data: {json.dumps({'status': 'progress', 'progress_type': 'initializing_fp'})}\n\n"
 
             region_context = ""
-            region = request.region or "Center"
+            region = request.region or "Centre"
             region_contexts = {
-                "Douala": "Design for Douala's coastal climate: elevated foundation, high cross-ventilation, wide verandas.",
-                "Yaoundé": "Design for Yaoundé's steep terrain: multi-level layout, retaining walls, stone accents.",
-                "Coastal": "Design for coastal Cameroon: flood-safe elevated structure, large shaded areas, anti-corrosion materials.",
+                "Littoral": "Design for Douala's coastal climate: elevated foundation, high cross-ventilation, wide verandas.",
+                "Centre": "Design for Yaoundé's steep terrain: multi-level layout, retaining walls, stone accents.",
                 "West": "Design for Western Highlands: deep roof overhangs, robust drainage, slope-adapted layout.",
                 "North": "Design for Sahelian climate: high thermal mass walls, high ceilings, small shaded openings, cross-ventilation.",
-                "Center": "Design for stable laterite soil: standard modern layout with good cross-ventilation.",
+                "Adamaoua": "Design for Adamaoua highland savannah: good cross-ventilation, sun-shading, spacious rooms.",
+                "North-West": "Design for North-West mountains: slope-adapted layout, deep drainage, sturdy foundations.",
+                "South": "Design for South Cameroon rainforest: high-pitched roofs, covered patios, good airflow.",
+                "East": "Design for East region: raised foundation, wide verandas, cross-ventilation for humid climate.",
+                "Far North": "Design for Far North extreme arid Sahel: compact layout, thermal mass walls, shaded openings.",
+                "South-West": "Design for South-West volcanic/coastal zone: elevated structure, flood-safe layout, corrosion-resistant.",
             }
-            region_context = region_contexts.get(region, "")
+            _legacy_map = {"Douala": "Littoral", "Yaoundé": "Centre", "Coastal": "South-West", "Center": "Centre"}
+            mapped_region = _legacy_map.get(region, region)
+            region_context = region_contexts.get(mapped_region, "")
 
             extras_desc = ""
             if request.extras:
                 extras_desc = "Include the following rooms: " + ", ".join(request.extras) + "."
 
-            kitchen_desc = "The kitchen should be open-plan, integrated with the living area." if request.kitchen_type == "open" else "The kitchen should be a separate enclosed room."
+            layout = await generate_floor_plan_layout(
+                num_bedrooms=request.num_bedrooms,
+                num_bathrooms=request.num_bathrooms,
+                kitchen_type=request.kitchen_type,
+                extras=request.extras,
+                gross_area=request.gross_area,
+            )
 
-            prompt = (
-                f"Professional architectural 2D floor plan for a Cameroon residential property. "
-                f"Specifications: {request.num_bedrooms} bedrooms, {request.num_bathrooms} bathrooms, "
+            for r in layout.rooms:
+                print(f"  [{layout.source}] {r.name}: {r.x_cm:.0f},{r.y_cm:.0f}  {r.width_cm:.0f}x{r.height_cm:.0f}cm")
+            print(f"  Total: {layout.total_width_cm/100:.1f}m x {layout.total_height_cm/100:.1f}m = {layout.total_area_m2:.0f}m\u00b2")
+
+            prompt_3d = (
+                f"Professional 3D isometric cutaway view of a {request.num_bedrooms}-bedroom, "
+                f"{request.num_bathrooms}-bathroom Cameroon residence, "
                 f"gross floor area approximately {request.gross_area} square meters. "
-                f"{kitchen_desc} "
+                f"{'Open-plan kitchen.' if request.kitchen_type == 'open' else 'Separate enclosed kitchen.'} "
                 f"{extras_desc} "
                 f"{region_context} "
                 f"{request.additional_preferences or ''} "
-                "Style: Clean fine black vector-style linework on a solid, pure white background. "
-                "CRITICAL: Zero color, zero gray fills, zero realistic rendering, zero shading, and zero paper textures or blue grids. "
-                "Every line is a fine, clean, high-contrast crisp black outline stroke (CAD/Revit export style). "
-                "Show detailed room layouts, wall thicknesses, door swings, window placements, simple line-based furniture outlines, and room labels. "
-                "High quality technical architectural drawing standard, neat lines, no text outside labels."
+                "Show as a 3D isometric/perspective cutaway view of the floor plan, "
+                "with color-coded rooms, 3D furniture, and realistic materials. Warm inviting style. "
+                "ULTRA-HIGH QUALITY: 4K resolution, sharp focus, photorealistic quality, no blur, no artifacts."
             )
-
-            prompt_used = prompt
+            prompt_used = prompt_3d
 
             views = [
                 {"key": "floor_plan_main", "label": "Main Floor Plan"},
                 {"key": "floor_plan_annotated", "label": "Annotated Plan with Dimensions"},
+                {"key": "elevations_composite", "label": "Elevations (4-View)"},
+                {"key": "cross_section_view", "label": "Cross-Section View"},
+                {"key": "roof_plan_view", "label": "Roof Plan View"},
                 {"key": "floor_plan_3d", "label": "3D Isometric Layout View"},
             ]
             yield f"data: {json.dumps({'status': 'view_list', 'views': views})}\n\n"
@@ -513,26 +655,32 @@ async def generate_floor_plan(request: FloorPlanRequest, user=Depends(verify_tok
                 view_label = view["label"]
 
                 yield f"data: {json.dumps({'status': 'view_start', 'view_key': view_key, 'label': view_label})}\n\n"
-                yield f"data: {json.dumps({'status': 'progress', 'message': f'Generating {view_label}...'})}\n\n"
+                yield f"data: {json.dumps({'status': 'progress', 'progress_type': 'generating_fp', 'label': view_label})}\n\n"
 
                 if cancel_event.is_set():
                     yield f"data: {json.dumps({'status': 'cancelled'})}\n\n"
                     return
 
-                view_prompt = prompt
-                if view_key == "floor_plan_annotated":
-                    view_prompt = prompt + " Add precise thin black dimension lines, measurement labels in meters, room area labels, and a clean north arrow. Professional technical construction document style."
-                elif view_key == "floor_plan_3d":
-                    view_prompt = prompt + " Show as a 3D isometric/perspective cutaway view of the floor plan, with color-coded rooms, 3D furniture, and realistic materials. Warm inviting style."
+                img_bytes = None
 
-                img_bytes = await ai_service.generate_floor_plan_image(view_prompt)
+                if view_key in ("floor_plan_main", "floor_plan_annotated"):
+                    annotated = view_key == "floor_plan_annotated"
+                    img_bytes = await render_floor_plan(layout, annotated)
+                elif view_key == "elevations_composite":
+                    img_bytes = await asyncio.to_thread(render_elevations, layout)
+                elif view_key == "cross_section_view":
+                    img_bytes = await asyncio.to_thread(render_cross_section, layout)
+                elif view_key == "roof_plan_view":
+                    img_bytes = await asyncio.to_thread(render_roof_plan, layout)
+                elif view_key == "floor_plan_3d":
+                    img_bytes = await asyncio.to_thread(render_3d_wireframe, layout)
 
                 if cancel_event.is_set():
                     yield f"data: {json.dumps({'status': 'cancelled'})}\n\n"
                     return
 
                 if img_bytes:
-                    yield f"data: {json.dumps({'status': 'progress', 'message': f'Uploading {view_label}...'})}\n\n"
+                    yield f"data: {json.dumps({'status': 'progress', 'progress_type': 'uploading_fp', 'label': view_label})}\n\n"
 
                     if cancel_event.is_set():
                         yield f"data: {json.dumps({'status': 'cancelled'})}\n\n"
@@ -549,11 +697,12 @@ async def generate_floor_plan(request: FloorPlanRequest, user=Depends(verify_tok
                         "url": img_data["url"],
                         "storage_path": img_data["storage_path"],
                         "label": view_label,
+                        "view_key": view_key,
                     })
                     yield f"data: {json.dumps({'status': 'view_complete', 'view_key': view_key, 'label': view_label})}\n\n"
                 else:
                     yield f"data: {json.dumps({'status': 'view_error', 'view_key': view_key, 'label': view_label})}\n\n"
-                    yield f"data: {json.dumps({'status': 'progress', 'message': f'Failed to generate {view_label}.'})}\n\n"
+                    yield f"data: {json.dumps({'status': 'progress', 'progress_type': 'failed_fp', 'label': view_label})}\n\n"
 
             workspace_payload = {
                 "generation_id": generation_id,
@@ -566,6 +715,7 @@ async def generate_floor_plan(request: FloorPlanRequest, user=Depends(verify_tok
                     "kitchen_type": request.kitchen_type,
                     "extras": request.extras,
                     "region": request.region or "Center",
+                    "division": request.division,
                 },
             }
             yield f"data: {json.dumps({'status': 'complete', 'workspace': workspace_payload})}\n\n"
@@ -583,7 +733,12 @@ async def generate_floor_plan(request: FloorPlanRequest, user=Depends(verify_tok
 async def save_floor_plan(request: SaveFloorPlanRequest, user=Depends(verify_token)):
     user_id = user["uid"]
     try:
-        images_dict = [{"url": img.url, "storage_path": img.storage_path, "label": getattr(img, "label", None)} for img in request.images]
+        images_dict = [{
+            "url": img.url,
+            "storage_path": img.storage_path,
+            "label": getattr(img, "label", None),
+            "view_key": getattr(img, "view_key", None),
+        } for img in request.images]
         doc_id = await db_service.save_floor_plan_generation(
             user_id=user_id,
             client_name=request.client_name,
@@ -663,6 +818,7 @@ async def get_shared_generation(share_token: str):
             "num_stories": result.get("num_stories"),
             "overall_layout": result.get("overall_layout", ""),
             "region": result.get("region", "Center"),
+            "division": result.get("division", ""),
             "outdoor_spaces": result.get("outdoor_spaces", []),
             "key_rooms": result.get("key_rooms", []),
             "construction_standard": result.get("construction_standard"),
@@ -680,10 +836,28 @@ async def get_shared_generation(share_token: str):
 @router.post("/generate/floor-plan/room", response_model=GenerationImage)
 async def regenerate_floor_plan_view(request: SingleFloorPlanViewRequest, user=Depends(verify_token)):
     try:
-        prompt = request.prompt or "Regenerate the floor plan view with the same specifications."
-        img_bytes = await ai_service.generate_floor_plan_image(prompt)
+        spec = request.specification
+
+        if spec and request.view_type in _FLOOR_PLAN_VIEW_RENDERERS:
+            layout = await generate_floor_plan_layout(
+                num_bedrooms=spec.num_bedrooms,
+                num_bathrooms=spec.num_bathrooms,
+                kitchen_type=spec.kitchen_type,
+                extras=spec.extras,
+                gross_area=spec.gross_area,
+            )
+            renderer = _FLOOR_PLAN_VIEW_RENDERERS[request.view_type]
+            img_bytes = await renderer(layout)
+        else:
+            prompt = request.prompt or "Regenerate the floor plan view with the same specifications."
+            img_bytes = await ai_service.generate_floor_plan_image(
+                prompt,
+                view_type=request.view_type or "floor_plan_main",
+                overlay_language="en",
+            )
+
         if not img_bytes:
-            raise Exception("AI failed to generate floor plan image.")
+            raise Exception("Failed to generate floor plan image.")
         random_idx = int(uuid.uuid4().int % 10000)
         img_data = await storage_service.upload_image(
             image_bytes=img_bytes,
@@ -697,3 +871,150 @@ async def regenerate_floor_plan_view(request: SingleFloorPlanViewRequest, user=D
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Floor plan regeneration failed: {str(e)}",
         )
+
+
+@router.get("/images/proxy")
+async def proxy_image(url: str = Query(...)):
+    """Proxy image requests to bypass browser CORS restrictions on Firebase Storage."""
+    allowed_prefixes = [
+        "https://storage.googleapis.com/g-house-d458c.appspot.com/",
+        "https://storage.googleapis.com/g-house-d458c.firebasestorage.app/",
+        "https://firebasestorage.googleapis.com/v0/b/g-house-d458c.appspot.com/",
+    ]
+    if not any(url.startswith(p) for p in allowed_prefixes):
+        raise HTTPException(status_code=400, detail="Invalid image URL origin")
+
+    import httpx
+    headers = {"User-Agent": "7G-House-Proxy/1.0"}
+    async with httpx.AsyncClient(headers=headers, timeout=30.0) as client:
+        resp = await client.get(url, follow_redirects=True)
+        resp.raise_for_status()
+        content_type = resp.headers.get("content-type", "image/png")
+        return Response(content=resp.content, media_type=content_type)
+
+
+@router.get("/generation/{generation_id}/pdf")
+async def download_generation_pdf(generation_id: str, user=Depends(verify_token)):
+    """
+    Build and stream a branded multi-page PDF for the given generation.
+    Images are fetched server-side so there are no browser CORS issues.
+    """
+    from app.services.pdf_service import build_project_pdf, upload_pdf_to_storage
+    from app.repositories.generation_repository import set_telegram_pdf_url
+    import httpx
+
+    user_id = user["uid"]
+    is_admin = user.get("role") == "admin"
+
+    try:
+        result = await db_service.get_generation(generation_id, user_id, is_admin=is_admin)
+        if not result:
+            raise HTTPException(status_code=404, detail="Generation not found or access denied")
+
+        client_name = result.get("client_name") or result.get("house_style") or "Project"
+        safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in client_name)
+        filename = f"7G_House_{safe_name}_Report.pdf"
+
+        cached_pdf_url = result.get("telegram_pdf_url", "")
+        if cached_pdf_url:
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    resp = await client.get(cached_pdf_url, follow_redirects=True)
+                    resp.raise_for_status()
+                    return StreamingResponse(
+                        iter([resp.content]),
+                        media_type="application/pdf",
+                        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+                    )
+            except Exception as e:
+                logger.warning(f"download_generation_pdf: cached PDF fetch failed, rebuilding: {e}")
+
+        pdf_buf = await build_project_pdf(result)
+        if not pdf_buf:
+            raise HTTPException(status_code=500, detail="Failed to generate PDF")
+
+        try:
+            pdf_url = await upload_pdf_to_storage(pdf_buf, generation_id)
+            if pdf_url:
+                await set_telegram_pdf_url(generation_id, pdf_url)
+        except Exception as e:
+            logger.warning(f"download_generation_pdf: failed to cache PDF: {e}")
+
+        pdf_buf.seek(0)
+        return StreamingResponse(
+            pdf_buf,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"PDF generation failed: {str(e)}")
+
+
+@router.post("/generation/{generation_id}/pdf/upload")
+async def upload_generation_pdf(generation_id: str, user=Depends(verify_token)):
+    """
+    Build a branded PDF, upload it to Firebase Storage, persist its URL,
+    and return the public download URL.
+    Used by the frontend Telegram quick-share flow.
+    """
+    from app.services.pdf_service import build_project_pdf, upload_pdf_to_storage
+    from app.repositories.generation_repository import set_telegram_pdf_url
+
+    user_id = user["uid"]
+    is_admin = user.get("role") == "admin"
+
+    try:
+        result = await db_service.get_generation(generation_id, user_id, is_admin=is_admin)
+        if not result:
+            raise HTTPException(status_code=404, detail="Generation not found or access denied")
+
+        pdf_buf = await build_project_pdf(result)
+        if not pdf_buf:
+            raise HTTPException(status_code=500, detail="Failed to generate PDF")
+
+        pdf_url = await upload_pdf_to_storage(pdf_buf, generation_id)
+        if not pdf_url:
+            raise HTTPException(status_code=500, detail="Failed to upload PDF to storage")
+
+        # Persist so the Telegram bot can reuse it without rebuilding
+        await set_telegram_pdf_url(generation_id, pdf_url)
+
+        return {"pdf_url": pdf_url}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"PDF upload failed: {str(e)}")
+
+
+@router.delete("/generation/{generation_id}/pdf")
+async def delete_generation_pdf(generation_id: str, user=Depends(verify_token)):
+    """
+    Delete the cached PDF for a generation from Firebase Storage and clear
+    the pdf_url field in Firestore.
+    """
+    from app.services.pdf_service import delete_pdf_from_storage
+    from app.repositories.generation_repository import delete_generation_pdf as db_delete_pdf
+
+    user_id = user["uid"]
+    is_admin = user.get("role") == "admin"
+
+    try:
+        result = await db_service.get_generation(generation_id, user_id, is_admin=is_admin)
+        if not result:
+            raise HTTPException(status_code=404, detail="Generation not found or access denied")
+
+        pdf_url = result.get("telegram_pdf_url", "")
+        if not pdf_url:
+            return {"ok": True, "message": "No PDF to delete"}
+
+        await delete_pdf_from_storage(pdf_url)
+        await db_delete_pdf(generation_id)
+
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"PDF deletion failed: {str(e)}")
+

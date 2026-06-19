@@ -23,6 +23,7 @@ class GenerationRequest(BaseModel):
     key_rooms: list[str] = Field(default_factory=list, description="Additional key rooms (home office, bonus room, media room, etc.)")
     # Cameroon
     region: str = Field("Center", description="Cameroon Region")
+    division: str = Field("", description="Cameroon Division (sub-region)")
     additional_preferences: Optional[str] = Field(None, description="Extra details or preferences")
 
 
@@ -52,11 +53,15 @@ class GenerationResponse(BaseModel):
     key_rooms: list[str] = []
     # Cameroon
     region: str = "Center"
+    division: str = ""
     additional_preferences: Optional[str] = None
     images: list[GenerationImage]
     prompt_used: str
     created_at: str
     user_id: str
+    # PDF
+    pdf_url: Optional[str] = None
+    pdf_generated_at: Optional[str] = None
 
 
 class WorkspaceResponse(BaseModel):
@@ -83,6 +88,7 @@ class SingleRoomRequest(BaseModel):
     kitchen_type: str
     key_rooms: list[str] = []
     region: str = "Center"
+    division: str = ""
     additional_preferences: Optional[str] = None
 
 
@@ -107,6 +113,7 @@ class SaveGenerationRequest(BaseModel):
     key_rooms: list[str] = []
     # Cameroon
     region: str = "Center"
+    division: str = ""
     additional_preferences: Optional[str] = None
     prompt_used: str
     images: list[GenerationImage]
@@ -120,9 +127,12 @@ class GenerationHistoryItem(BaseModel):
     gross_area: str = ""
     num_bedrooms: int = 0
     region: str = "Center"
+    division: str = ""
     thumbnail_url: Optional[str] = None
     image_count: int = 0
     created_at: str
+    pdf_url: Optional[str] = None
+    pdf_generated_at: Optional[str] = None
 
 
 class GenerationUpdate(BaseModel):
@@ -138,6 +148,7 @@ class FloorPlanRequest(BaseModel):
     kitchen_type: str = Field(..., description="Kitchen layout: 'open' or 'closed'")
     extras: list[str] = Field(default_factory=list, description="Additional room types (e.g. walk-in closet, laundry room)")
     region: Optional[str] = Field("Center", description="Cameroon target region")
+    division: str = Field("", description="Cameroon target division")
     additional_preferences: Optional[str] = Field(None, description="Extra preferences for the floor plan")
 
 
@@ -148,6 +159,7 @@ class FloorPlanSpecification(BaseModel):
     kitchen_type: str
     extras: list[str]
     region: str
+    division: str = ""
 
 
 class FloorPlanWorkspaceResponse(BaseModel):
@@ -157,10 +169,15 @@ class FloorPlanWorkspaceResponse(BaseModel):
     specification: FloorPlanSpecification
 
 
+class CleanupRequest(BaseModel):
+    storage_paths: list[str]
+
+
 class SingleFloorPlanViewRequest(BaseModel):
     generation_id: str
     view_type: str
     prompt: Optional[str] = None
+    specification: Optional[FloorPlanSpecification] = None
 
 
 class SaveFloorPlanRequest(BaseModel):

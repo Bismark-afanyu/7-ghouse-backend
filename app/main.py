@@ -1,3 +1,9 @@
+import logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+from dotenv import load_dotenv
+load_dotenv()
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -7,6 +13,8 @@ mimetypes.init()
 from app.api.generations import router as generations_router
 from app.api.users import router as users_router
 from app.api.clients import router as clients_router
+from app.api.telegram import router as telegram_router
+from app.api.video import router as video_router
 
 app = FastAPI(
     title="7G House MVP API",
@@ -15,17 +23,22 @@ app = FastAPI(
 )
 
 # CORS
-# For development, we'll allow all origins using a regex or explicitly
 origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:3001,http://127.0.0.1:3000,http://127.0.0.1:3001").split(",")
+cors_regex = os.getenv("CORS_ORIGIN_REGEX", "")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origin_regex="https?://.*", # Allow all HTTP and HTTPS origins
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+cors_kwargs = {
+    "allow_origins": origins,
+    "allow_credentials": True,
+    "allow_methods": ["*"],
+    "allow_headers": ["*"],
+}
+
+if cors_regex:
+    cors_kwargs["allow_origin_regex"] = cors_regex
+elif not os.getenv("ALLOWED_ORIGINS"):
+    cors_kwargs["allow_origin_regex"] = r"https?://.*"
+
+app.add_middleware(CORSMiddleware, **cors_kwargs)
 
 
 @app.get("/")
@@ -58,3 +71,5 @@ async def add_process_time_header(request, call_next):
 app.include_router(generations_router, prefix="/api", tags=["generations"])
 app.include_router(users_router, prefix="/api/users", tags=["users"])
 app.include_router(clients_router, prefix="/api/clients", tags=["clients"])
+app.include_router(telegram_router, prefix="/api", tags=["telegram"])
+app.include_router(video_router, prefix="/api", tags=["video"])
