@@ -1,4 +1,3 @@
-.env
 venv/
 __pycache__/
 *.py[cod]
@@ -7,3 +6,6 @@ __pycache__/
 .gitignore
 static/
 firebase-adminsdk.json
+fonts/
+test_*
+gcs-cors.json

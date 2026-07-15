@@ -7,6 +7,27 @@ from typing import Optional
 
 _LAYOUT_CACHE: dict = {}
 
+ROOM_CODE_MAP = {
+    "living": "LR",
+    "living/dining": "LR",
+    "dining": "DIN",
+    "kitchen": "KIT",
+    "master_bedroom": "MBR",
+    "bedroom": "BR",
+    "bathroom": "BA",
+    "hallway": "HL",
+    "hall": "HL",
+    "corridor": "HL",
+    "utility": "UT",
+    "laundry": "LND",
+    "storage": "STO",
+    "pantry": "PNT",
+    "garage": "GAR",
+    "office": "OFF",
+    "study": "STU",
+    "other": "OT",
+}
+
 
 @dataclass
 class WallOpening:
@@ -54,25 +75,33 @@ async def generate_floor_plan_layout(
     kitchen_type: str = "open",
     extras: Optional[list[str]] = None,
     gross_area: str = "150",
+    land_length: Optional[float] = None,
+    land_width: Optional[float] = None,
+    num_kitchens: int = 1,
+    num_living_rooms: int = 1,
 ) -> FloorPlanLayout:
     extras = extras or []
 
-    error = validate_feasibility(num_bedrooms, num_bathrooms, kitchen_type, extras, gross_area)
+    error = validate_feasibility(num_bedrooms, num_bathrooms, kitchen_type, extras, gross_area, num_kitchens=num_kitchens, num_living_rooms=num_living_rooms)
     if error:
         print(f"Pre-flight validation: {error}")
         area_m2 = max(float(gross_area), 30.0)
-        layout = _deterministic_layout(num_bedrooms, num_bathrooms, kitchen_type, extras, gross_area)
+        layout = _deterministic_layout(num_bedrooms, num_bathrooms, kitchen_type, extras, gross_area, land_length, land_width, num_kitchens=num_kitchens, num_living_rooms=num_living_rooms)
         _add_building_openings(layout)
         _assign_room_codes(layout)
         return layout
 
-    ck = _cache_key(num_bedrooms, num_bathrooms, kitchen_type, extras, gross_area)
+    ck = _cache_key(num_bedrooms, num_bathrooms, kitchen_type, extras, gross_area, land_length, land_width, num_kitchens=num_kitchens, num_living_rooms=num_living_rooms)
     cached = _get_cached(ck)
     if cached is not None:
         print(f"Cache hit for config {ck}")
         return _deep_copy_layout(cached)
 
-    layout = await _try_gemini_layout_multi(num_bedrooms, num_bathrooms, kitchen_type, extras, gross_area)
+    layout = await _try_gemini_layout_multi(
+        num_bedrooms, num_bathrooms, kitchen_type, extras, gross_area,
+        land_length=land_length, land_width=land_width,
+        num_kitchens=num_kitchens, num_living_rooms=num_living_rooms,
+    )
     if layout is not None and _validate_layout(layout):
         layout = _self_heal_layout(layout)
         _add_building_openings(layout)
@@ -80,7 +109,7 @@ async def generate_floor_plan_layout(
         _set_cache(ck, layout)
         return layout
 
-    layout = _deterministic_layout(num_bedrooms, num_bathrooms, kitchen_type, extras, gross_area)
+    layout = _deterministic_layout(num_bedrooms, num_bathrooms, kitchen_type, extras, gross_area, land_length, land_width, num_kitchens=num_kitchens, num_living_rooms=num_living_rooms)
     layout = _self_heal_layout(layout)
     _add_building_openings(layout)
     _assign_room_codes(layout)
@@ -117,20 +146,33 @@ def _deep_copy_layout(layout: FloorPlanLayout) -> FloorPlanLayout:
 async def _try_gemini_layout_multi(
     num_bedrooms: int, num_bathrooms: int,
     kitchen_type: str, extras: list[str], gross_area: str,
+    land_length: Optional[float] = None,
+    land_width: Optional[float] = None,
+    num_kitchens: int = 1,
+    num_living_rooms: int = 1,
 ) -> Optional[FloorPlanLayout]:
     try:
-        from app.db.firebase import settings
-        api_key = settings.GEMINI_API_KEY
-        if not api_key:
-            return None
-        from google import genai
+        from app.services.genai_client import get_genai_client
         from google.genai import types
-        client = genai.Client(api_key=api_key)
+        client = get_genai_client()
     except Exception as e:
         print(f"Gemini init failed: {e}")
         return None
 
     extras_line = ", ".join(extras) if extras else "None"
+
+    land_constraint = ""
+    if land_length and land_width:
+        land_w_cm = land_width * 100
+        land_h_cm = land_length * 100
+        land_constraint = (
+            f"LAND CONSTRAINTS:\n"
+            f"- The building must fit within a {land_width}m x {land_length}m (W x L) plot.\n"
+            f"- Total building width must be close to {land_w_cm:.0f} cm.\n"
+            f"- Total building height must be close to {land_h_cm:.0f} cm.\n"
+            f"- The building aspect ratio should follow the land: approximately {land_width}:{land_length}.\n\n"
+        )
+
     prompt = (
         "You are an expert architectural space planner. Generate exactly TWO alternative "
         "rectangular single-story floor plan layouts as a JSON array. "
@@ -138,9 +180,12 @@ async def _try_gemini_layout_multi(
         "REQUIREMENTS:\n"
         f"- Bedrooms: {num_bedrooms} (includes 1 master bedroom)\n"
         f"- Bathrooms: {num_bathrooms}\n"
+        f"- Kitchens: {num_kitchens}\n"
+        f"- Living rooms: {num_living_rooms}\n"
         f"- Kitchen: {kitchen_type} style (\"open\" = open-plan with living area)\n"
         f"- Additional spaces: {extras_line}\n"
         f"- Gross floor area: ~{gross_area} m\u00b2\n\n"
+        f"{land_constraint}"
         "OUTPUT STRUCTURE (a JSON array of two objects):\n"
         "[\n"
         "  {\n"
@@ -162,6 +207,7 @@ async def _try_gemini_layout_multi(
         "CONSTRAINTS:\n"
         f"1. The total area (total_width_cm x total_height_cm / 10000) must be close to {gross_area} m\u00b2.\n"
         "2. Aspect ratio should be approximately 16:9 (total_width_cm / total_height_cm \u2248 1.78).\n"
+        "   If land dimensions are provided above, use the land aspect ratio instead.\n"
         "3. All rooms must tile perfectly within the total rectangle \u2014 no gaps, no overlaps.\n"
         "4. Coordinates are top-left corners: x_cm ranges 0 to total_width_cm, y_cm ranges 0 to total_height_cm.\n"
         "5. Typical room widths (cm): Living 400\u2013550, Master Bedroom 350\u2013500, Bedroom 300\u2013400, "
@@ -175,7 +221,7 @@ async def _try_gemini_layout_multi(
         "Generate two valid, realistic, distinct floor plans now as a JSON array."
     )
 
-    models_to_try = ["gemini-2.0-flash-001", "gemini-2.5-pro-exp-03-25"]
+    models_to_try = ["gemini-2.5-flash", "gemini-3.1-flash-lite"]
 
     for model_name in models_to_try:
         try:
@@ -287,6 +333,8 @@ def validate_feasibility(
     kitchen_type: str = "open",
     extras: Optional[list[str]] = None,
     gross_area: str = "150",
+    num_kitchens: int = 1,
+    num_living_rooms: int = 1,
 ) -> Optional[str]:
     extras = extras or []
     area_m2 = float(gross_area)
@@ -302,11 +350,12 @@ def validate_feasibility(
         "other": 4.0,
     }
 
-    required = [
-        ("living", 16.0),
-        ("master_bedroom", 14.0),
-        ("kitchen", 7.0),
-    ]
+    required = []
+    for _ in range(num_living_rooms):
+        required.append(("living", 16.0))
+    required.append(("master_bedroom", 14.0))
+    for _ in range(num_kitchens):
+        required.append(("kitchen", 7.0))
     for _ in range(num_bedrooms - 1):
         required.append(("bedroom", 9.0))
     for _ in range(num_bathrooms):
@@ -326,8 +375,8 @@ def validate_feasibility(
             f"Minimum ~{min_total:.0f}m\u00b2 needed (shortfall: {shortfall:.0f}m\u00b2)."
         )
 
-    if num_bedrooms > 8:
-        return f"Maximum 8 bedrooms supported (requested: {num_bedrooms})."
+    if num_bedrooms > 15:
+        return f"Maximum 15 bedrooms supported (requested: {num_bedrooms})."
 
     return None
 
@@ -407,26 +456,6 @@ def _add_building_openings(layout: FloorPlanLayout):
 
 def _assign_room_codes(layout):
     """Assign architectural room codes (BR1, BR2, MBR, LR, KIT, BA1, etc.)."""
-    ROOM_CODE_MAP = {
-        "living": "LR",
-        "living/dining": "LR",
-        "dining": "DIN",
-        "kitchen": "KIT",
-        "master_bedroom": "MBR",
-        "bedroom": "BR",
-        "bathroom": "BA",
-        "hallway": "HL",
-        "hall": "HL",
-        "corridor": "HL",
-        "utility": "UT",
-        "laundry": "LND",
-        "storage": "STO",
-        "pantry": "PNT",
-        "garage": "GAR",
-        "office": "OFF",
-        "study": "STU",
-        "other": "OT",
-    }
     counters = {}
     for room in layout.rooms:
         rt = (room.room_type or '').lower()
@@ -526,9 +555,12 @@ def _horizontally_aligned(r1, r2, threshold: float = 0.3) -> bool:
 def _cache_key(
     num_bedrooms: int, num_bathrooms: int,
     kitchen_type: str, extras: list[str], gross_area: str,
+    land_length: Optional[float] = None, land_width: Optional[float] = None,
+    num_kitchens: int = 1, num_living_rooms: int = 1,
 ) -> str:
     area_bucket = str(round(float(gross_area) / 10) * 10)
-    raw = f"{num_bedrooms}|{num_bathrooms}|{kitchen_type}|{sorted(extras)}|{area_bucket}"
+    land_part = f"|{land_length or ''}x{land_width or ''}"
+    raw = f"{num_bedrooms}|{num_bathrooms}|{kitchen_type}|{sorted(extras)}|{area_bucket}{land_part}|{num_kitchens}|{num_living_rooms}"
     return hashlib.md5(raw.encode()).hexdigest()
 
 
@@ -543,13 +575,19 @@ def _set_cache(key: str, layout: FloorPlanLayout):
 def _deterministic_layout(
     num_bedrooms: int, num_bathrooms: int,
     kitchen_type: str, extras: list[str], gross_area: str,
+    land_length: Optional[float] = None,
+    land_width: Optional[float] = None,
+    num_kitchens: int = 1,
+    num_living_rooms: int = 1,
 ) -> FloorPlanLayout:
     area_m2 = max(float(gross_area), 30.0)
 
     room_specs: list[tuple[str, str, float]] = []
-    room_specs.append(("Living/Dining", "living", 1.5))
+    for i in range(num_living_rooms):
+        room_specs.append((f"Living/Dining" if num_living_rooms == 1 else f"Living/Dining {i + 1}", "living", 1.5))
     room_specs.append(("Master Bedroom", "master_bedroom", 1.0))
-    room_specs.append(("Kitchen", "kitchen", 0.7))
+    for i in range(num_kitchens):
+        room_specs.append((f"Kitchen" if num_kitchens == 1 else f"Kitchen {i + 1}", "kitchen", 0.7))
 
     for i in range(max(0, num_bedrooms - 1)):
         room_specs.append((f"Bedroom {i + 1}", "bedroom", 0.65))
@@ -561,19 +599,26 @@ def _deterministic_layout(
         room_specs.append((extra, "other" if extra.lower() not in ROOM_CODE_MAP else extra.lower(), 0.4))
 
     n = len(room_specs)
+
+    if land_length and land_width:
+        total_width_cm = land_width * 100
+        total_height_cm = land_length * 100
+        building_area_m2 = (total_width_cm * total_height_cm) / 10000
+        if building_area_m2 < area_m2 * 0.5:
+            total_width_cm = math.sqrt(area_m2 * 10000 * 16 / 9)
+            total_height_cm = total_width_cm * 9 / 16
+    else:
+        aspect = 16.0 / 9.0
+        total_area_cm2 = area_m2 * 10000
+        total_width_cm = math.sqrt(total_area_cm2 * aspect)
+        total_height_cm = total_width_cm / aspect
+
     if n <= 3:
         num_cols = n
     elif n <= 6:
         num_cols = 3
     else:
         num_cols = 4
-
-    aspect = 16.0 / 9.0
-    total_weight = sum(w for _, _, w in room_specs)
-
-    total_area_cm2 = area_m2 * 10000
-    total_width_cm = math.sqrt(total_area_cm2 * aspect)
-    total_height_cm = total_width_cm / aspect
 
     rows: list[list[tuple[str, str, float]]] = []
     for i in range(0, n, num_cols):

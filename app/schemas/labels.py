@@ -25,9 +25,10 @@ class ViewLabelConfig:
 
 VIEW_LABEL_CONFIGS: dict[str, ViewLabelConfig] = {
     "floor_plans_composite": ViewLabelConfig(
-        labels=[
-            LabelItem("Floor Plans", "Plans d'étage", 0.50, 0.03, "ct"),
-        ],
+        show_title_banner=True,
+        title_en="Floor Plans",
+        title_fr="Plans d'étage",
+        show_legend=False,
     ),
     "elevations_composite": ViewLabelConfig(
         labels=[
@@ -59,30 +60,25 @@ VIEW_LABEL_CONFIGS: dict[str, ViewLabelConfig] = {
         show_title_banner=True,
         title_en="Top-Down View",
         title_fr="Vue aérienne",
-        show_legend=True,
+        show_legend=False,
     ),
     "topdown_3d_ground_floor": ViewLabelConfig(
         show_title_banner=True,
         title_en="Ground Floor",
         title_fr="Rez-de-chaussée",
-        show_legend=True,
+        show_legend=False,
     ),
     "topdown_3d_upper_floor": ViewLabelConfig(
         show_title_banner=True,
         title_en="Upper Floor",
         title_fr="Étage supérieur",
-        show_legend=True,
+        show_legend=False,
     ),
-    "cross_section_view": ViewLabelConfig(
+    "measurements_table": ViewLabelConfig(
         show_title_banner=True,
-        title_en="Cross-Section A-A",
-        title_fr="Coupe A-A",
-        labels=[
-            LabelItem("Roof Structure", "Structure du toit", 0.03, 0.10, "lt"),
-            LabelItem("Upper Floor", "Étage supérieur", 0.03, 0.35, "lt"),
-            LabelItem("Ground Floor", "Rez-de-chaussée", 0.03, 0.60, "lt"),
-            LabelItem("Foundation", "Fondation", 0.03, 0.85, "lt"),
-        ],
+        title_en="Room Measurements",
+        title_fr="Plan des chambres",
+        show_legend=False,
     ),
     "floor_plan_main": ViewLabelConfig(
         labels=[

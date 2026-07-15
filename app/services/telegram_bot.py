@@ -13,12 +13,16 @@ logger = logging.getLogger(__name__)
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN environment variable is required")
+    logger.warning("TELEGRAM_BOT_TOKEN not set — Telegram features disabled")
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
 
-_request = HTTPXRequest(connection_pool_size=8)
-bot = Bot(token=TOKEN, request=_request)
+bot = None
+if TOKEN:
+    _request = HTTPXRequest(connection_pool_size=8)
+    bot = Bot(token=TOKEN, request=_request)
+else:
+    logger.warning("Telegram bot not initialized (no token)")
 
 MAX_RETRIES = 3
 RETRY_BACKOFF_BASE = 1.0  # seconds
@@ -105,6 +109,8 @@ async def handle_start(update: Update) -> None:
 
 
 async def handle_link(update: Update) -> None:
+    if not bot:
+        return
     from datetime import datetime, timezone
     chat_id = update.effective_chat.id
     code = "".join(random.choices(string.digits, k=6))
@@ -133,6 +139,8 @@ async def handle_link(update: Update) -> None:
 
 
 async def _send_welcome(chat_id: int) -> None:
+    if not bot:
+        return
     await bot.send_message(
         chat_id=chat_id,
         text=(
@@ -148,7 +156,47 @@ async def _send_welcome(chat_id: int) -> None:
     )
 
 
+async def _send_video_helper(chat_id: int, video_url: str, caption: str) -> None:
+    if not bot or not video_url:
+        return
+
+    # Try downloading and sending as a file buffer (bypasses 20MB URL limit, up to 50MB limit)
+    try:
+        import httpx
+        logger.info(f"Downloading video from {video_url} to send to Telegram...")
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            resp = await client.get(video_url, follow_redirects=True)
+            resp.raise_for_status()
+            video_bytes = io.BytesIO(resp.content)
+            video_bytes.name = "walkthrough.mp4"
+            await _send_with_retry(
+                bot.send_video,
+                chat_id=chat_id,
+                video=video_bytes,
+                caption=caption,
+                parse_mode="Markdown",
+            )
+            return
+    except Exception as e:
+        logger.warning(f"Failed to download and send video by bytes: {e}. Falling back to URL.")
+
+    # Fallback to direct URL sending (limited to 20MB by Telegram)
+    try:
+        await _send_with_retry(
+            bot.send_video,
+            chat_id=chat_id,
+            video=video_url,
+            caption=caption,
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.error(f"Failed to send video by URL: {e}")
+        raise e
+
+
 async def _send_shared_project(chat_id: int, share_token: str) -> None:
+    if not bot:
+        return
     from app.repositories.generation_repository import get_generation_by_share_token
 
     result = await get_generation_by_share_token(share_token)
@@ -160,7 +208,11 @@ async def _send_shared_project(chat_id: int, share_token: str) -> None:
         return
 
     images = result.get("images", [])
+    video_external_url = result.get("video_external_url", "")
+    video_internal_url = result.get("video_internal_url", "")
     share_url = f"{FRONTEND_URL}/shared?token={share_token}"
+
+    pdf_sent = False
 
     # 1. Try a pre-generated PDF stored on Firebase Storage
     pdf_url = result.get("telegram_pdf_url", "")
@@ -180,48 +232,83 @@ async def _send_shared_project(chat_id: int, share_token: str) -> None:
                     caption="📄 *7G House Project Report*",
                     parse_mode="Markdown",
                 )
-                return
+                pdf_sent = True
         except Exception as e:
             logger.warning(f"_send_shared_project: stored PDF failed, building fresh: {e}")
 
     # 2. Build a rich branded PDF on-the-fly
-    pdf_buf = await _get_rich_pdf(result)
-    if pdf_buf:
-        try:
-            await bot.send_document(
-                chat_id=chat_id,
-                document=pdf_buf,
-                filename="Project_Report.pdf",
-                caption="📄 *7G House Project Report*",
-                parse_mode="Markdown",
-            )
-            return
-        except Exception as e:
-            logger.warning(f"_send_shared_project: PDF send failed, falling back to images: {e}")
+    if not pdf_sent:
+        pdf_buf = await _get_rich_pdf(result)
+        if pdf_buf:
+            try:
+                await bot.send_document(
+                    chat_id=chat_id,
+                    document=pdf_buf,
+                    filename="Project_Report.pdf",
+                    caption="📄 *7G House Project Report*",
+                    parse_mode="Markdown",
+                )
+                pdf_sent = True
+            except Exception as e:
+                logger.warning(f"_send_shared_project: PDF send failed, falling back to images: {e}")
 
     # 3. Last-resort: send images individually
-    sent_count = 0
-    for img in images[:8]:
-        url = img.get("url", "")
-        if not url:
-            continue
-        try:
-            caption = img.get("label", "") if sent_count == 0 else None
-            await bot.send_photo(chat_id=chat_id, photo=url, caption=caption)
-            sent_count += 1
-        except Exception as e:
-            logger.warning(f"_send_shared_project: image send failed {url[:60]}: {e}")
+    if not pdf_sent:
+        sent_count = 0
+        for img in images[:8]:
+            url = img.get("url", "")
+            if not url:
+                continue
+            try:
+                caption = img.get("label", "") if sent_count == 0 else None
+                await bot.send_photo(chat_id=chat_id, photo=url, caption=caption)
+                sent_count += 1
+            except Exception as e:
+                logger.warning(f"_send_shared_project: image send failed {url[:60]}: {e}")
 
-    if len(images) > 8:
-        await bot.send_message(
-            chat_id=chat_id,
-            text=f"📸 *+{len(images) - 8} more images* — view them in the browser: {share_url}",
-            parse_mode="Markdown",
-            disable_web_page_preview=True,
-        )
+        if len(images) > 8:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"📸 *+{len(images) - 8} more images* — view them in the browser: {share_url}",
+                parse_mode="Markdown",
+                disable_web_page_preview=True,
+            )
+
+    # 4. Send videos next if present
+    if video_external_url:
+        try:
+            await _send_video_helper(chat_id, video_external_url, "🎬 *Exterior Walkthrough*")
+        except Exception as e:
+            logger.warning(f"_send_shared_project: failed to send exterior video: {e}")
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=f"🎬 *Exterior Walkthrough*\n📹 [Open Video]({video_external_url})",
+                    parse_mode="Markdown",
+                    disable_web_page_preview=False,
+                )
+            except Exception:
+                pass
+
+    if video_internal_url:
+        try:
+            await _send_video_helper(chat_id, video_internal_url, "🎬 *Interior Walkthrough*")
+        except Exception as e:
+            logger.warning(f"_send_shared_project: failed to send interior video: {e}")
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=f"🎬 *Interior Walkthrough*\n📹 [Open Video]({video_internal_url})",
+                    parse_mode="Markdown",
+                    disable_web_page_preview=False,
+                )
+            except Exception:
+                pass
 
 
 async def send_project_to_chat(chat_id: int, generation_id: str) -> bool:
+    if not bot:
+        return False
     from app.repositories.generation_repository import get_generation_by_id_for_telegram
 
     result = await get_generation_by_id_for_telegram(generation_id)
@@ -229,16 +316,20 @@ async def send_project_to_chat(chat_id: int, generation_id: str) -> bool:
         return False
 
     images = result.get("images", [])
-    video_url = result.get("video_url", "")
+    video_external_url = result.get("video_external_url", "")
+    video_internal_url = result.get("video_internal_url", "")
     pdf_url = result.get("telegram_pdf_url", "")
 
-    if video_url:
-        try:
-            await _send_with_retry(bot.send_video, chat_id=chat_id, video=video_url, caption="🎬 *Walkthrough Video*", parse_mode="Markdown")
-            return True
-        except Exception as e:
-            logger.warning(f"Failed to send video after retries, falling back: {e}")
+    logger.info(
+        f"Sending project {generation_id} to chat {chat_id}: "
+        f"ext_video={'yes' if video_external_url else 'no'}, "
+        f"int_video={'yes' if video_internal_url else 'no'}, "
+        f"pdf={'yes' if pdf_url else 'no'}"
+    )
 
+    pdf_sent = False
+
+    # 1. Try sending pre-generated PDF
     if pdf_url:
         try:
             import httpx
@@ -248,33 +339,75 @@ async def send_project_to_chat(chat_id: int, generation_id: str) -> bool:
                 resp.raise_for_status()
                 pdf_bytes = io.BytesIO(resp.content)
                 pdf_bytes.name = "Project_Report.pdf"
-                await _send_with_retry(bot.send_document, chat_id=chat_id, document=pdf_bytes, filename="Project_Report.pdf")
-            return True
+                await _send_with_retry(
+                    bot.send_document,
+                    chat_id=chat_id,
+                    document=pdf_bytes,
+                    filename="Project_Report.pdf",
+                    caption="📄 *7G House Project Report*",
+                    parse_mode="Markdown",
+                )
+                pdf_sent = True
         except Exception as e:
             logger.warning(f"Failed to send pre-generated PDF after retries, falling back: {e}")
 
-    pdf_buf = await _get_rich_pdf(result)
-    if pdf_buf:
-        try:
-            await _send_with_retry(
-                bot.send_document,
-                chat_id=chat_id,
-                document=pdf_buf,
-                filename="Project_Report.pdf",
-                caption="📄 *7G House Project Report*",
-                parse_mode="Markdown",
-            )
-            return True
-        except Exception as e:
-            logger.warning(f"Failed to send PDF after retries, falling back: {e}")
+    # 2. Try sending rich PDF built on-the-fly
+    if not pdf_sent:
+        pdf_buf = await _get_rich_pdf(result)
+        if pdf_buf:
+            try:
+                await _send_with_retry(
+                    bot.send_document,
+                    chat_id=chat_id,
+                    document=pdf_buf,
+                    filename="Project_Report.pdf",
+                    caption="📄 *7G House Project Report*",
+                    parse_mode="Markdown",
+                )
+                pdf_sent = True
+            except Exception as e:
+                logger.warning(f"Failed to send PDF after retries, falling back: {e}")
 
-    for img in images[:8]:
-        url = img.get("url", "")
-        if not url:
-            continue
+    # 3. Fallback: individual images if PDF failed
+    if not pdf_sent:
+        for img in images[:8]:
+            url = img.get("url", "")
+            if not url:
+                continue
+            try:
+                await _send_with_retry(bot.send_photo, chat_id=chat_id, photo=url)
+            except Exception as e:
+                logger.warning(f"Failed to send image after retries: {e}")
+
+    # 4. Send videos next if present
+    if video_external_url:
         try:
-            await _send_with_retry(bot.send_photo, chat_id=chat_id, photo=url)
+            await _send_video_helper(chat_id, video_external_url, "🎬 *Exterior Walkthrough*")
         except Exception as e:
-            logger.warning(f"Failed to send image after retries: {e}")
+            logger.warning(f"Failed to send exterior video after retries: {e}")
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=f"🎬 *Exterior Walkthrough*\n📹 [Open Video]({video_external_url})",
+                    parse_mode="Markdown",
+                    disable_web_page_preview=False,
+                )
+            except Exception:
+                pass
+
+    if video_internal_url:
+        try:
+            await _send_video_helper(chat_id, video_internal_url, "🎬 *Interior Walkthrough*")
+        except Exception as e:
+            logger.warning(f"Failed to send interior video after retries: {e}")
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=f"🎬 *Interior Walkthrough*\n📹 [Open Video]({video_internal_url})",
+                    parse_mode="Markdown",
+                    disable_web_page_preview=False,
+                )
+            except Exception:
+                pass
 
     return True

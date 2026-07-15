@@ -1,4 +1,4 @@
-.PHONY: dev prod install clean
+.PHONY: dev prod install clean docker-build docker-run deploy set-env set-webhook
 
 VENV_BIN := venv/bin
 
@@ -6,7 +6,7 @@ dev:
 	$(VENV_BIN)/uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 
 prod:
-	uvicorn app.main:app --host 0.0.0.0 --port $(PORT)
+	uvicorn app.main:app --host 0.0.0.0 --port $(PORT) --workers 4
 
 install:
 	$(VENV_BIN)/pip install -r requirements.txt
@@ -25,7 +25,11 @@ deploy:
 		--source . \
 		--region europe-west1 \
 		--allow-unauthenticated \
+		--memory 4Gi \
 		--project g-house-d458c
+
+set-env:
+	./scripts/set_cloudrun_env.sh
 
 set-webhook:
 	$(VENV_BIN)/python scripts/register_webhook.py $(URL)

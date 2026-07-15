@@ -4,9 +4,11 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 from dotenv import load_dotenv
 load_dotenv()
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.exceptions import RequestValidationError, HTTPException
+from fastapi.responses import JSONResponse
 import os
 import mimetypes
 mimetypes.init()
@@ -41,6 +43,30 @@ elif not os.getenv("ALLOWED_ORIGINS"):
 app.add_middleware(CORSMiddleware, **cors_kwargs)
 
 
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=422,
+        content={"detail": exc.errors(), "body": exc.body},
+    )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+    )
+
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error"},
+    )
+
+
 @app.get("/")
 def root():
     return {"message": "7G House API is running"}
@@ -53,7 +79,7 @@ def health():
 
 # Create static directory if it doesn't exist
 if not os.path.exists("static"):
-    os.makedirs("static")
+    os.makedirs("static", exist_ok=True)
 
 # Mount static files with explicit headers
 app.mount("/static", StaticFiles(directory="static", html=True), name="static")

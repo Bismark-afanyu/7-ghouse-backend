@@ -225,7 +225,179 @@ def overlay_labels(
     if config.legend_labels:
         _draw_legend(img, draw, config.legend_labels, w, h, language)
 
+    _draw_watermark(img, w, h)
+
     img.paste(overlay, (0, 0), overlay)
+    img = img.convert("RGB")
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _draw_watermark(img: Image.Image, w: int, h: int):
+    """Draw a semi-transparent '7G House' text + logo watermark at bottom-right."""
+    logo_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+        "app", "assets", "logo.jpeg"
+    )
+    try:
+        if os.path.exists(logo_path):
+            logo = Image.open(logo_path).convert("RGBA")
+            logo_w = int(w * 0.06)
+            logo_h = int(logo.height * (logo_w / logo.width))
+            logo = logo.resize((logo_w, logo_h), Image.LANCZOS)
+            logo_r, logo_g, logo_b, logo_a = logo.split()
+            logo_a = logo_a.point(lambda a: int(a * 0.35))
+            logo = Image.merge("RGBA", (logo_r, logo_g, logo_b, logo_a))
+        else:
+            logo = None
+    except Exception:
+        logo = None
+
+    watermark = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    wm_draw = ImageDraw.Draw(watermark)
+
+    font_size = max(12, int(h * 0.018))
+    font = _load_font(font_size)
+    text = "7G House"
+    tw, th = _get_text_size(wm_draw, text, font)
+    pad = int(w * 0.01)
+
+    total_w = (logo_w if logo else 0) + (pad if logo else 0) + tw + pad * 2
+    total_h = max((logo_h if logo else 0), th) + pad * 2
+    bx = w - total_w - pad
+    by = h - total_h - pad
+
+    _draw_rounded_rect(wm_draw, bx, by, bx + total_w, by + total_h, radius=6, fill=(0, 0, 0, 100))
+
+    cx = bx + pad
+    if logo:
+        logo_y = by + (total_h - logo_h) // 2
+        watermark.paste(logo, (cx, logo_y), logo)
+        cx += logo_w + pad
+
+    text_y = by + (total_h - th) // 2
+    wm_draw.text((cx, text_y), text, font=font, fill=(255, 255, 255, 180))
+
+    img.paste(watermark, (0, 0), watermark)
+
+
+def overlay_room_labels(
+    image_bytes: bytes,
+    rooms: list,
+    total_width_cm: float,
+    total_height_cm: float,
+    language: str = "en",
+) -> bytes:
+    """
+    Overlay clean room labels on a top-down 3D view image.
+    Uses layout data to position labels at the center of each room.
+    """
+    ROOM_NAMES_FR = {
+        "living": "Salon",
+        "living/dining": "Salon/Salle à manger",
+        "dining": "Salle à manger",
+        "kitchen": "Cuisine",
+        "master_bedroom": "Chambre principale",
+        "bedroom": "Chambre",
+        "bathroom": "Salle de bain",
+        "hallway": "Couloir",
+        "hall": "Hall",
+        "corridor": "Couloir",
+        "utility": "Buanderie",
+        "laundry": "Buanderie",
+        "storage": "Rangement",
+        "pantry": "Garde-manger",
+        "garage": "Garage",
+        "office": "Bureau",
+        "study": "Bureau d'étude",
+        "other": "Autre",
+    }
+
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    w, h = img.size
+
+    margin_ratio = 0.08
+    usable_w = w * (1 - 2 * margin_ratio)
+    usable_h = h * (1 - 2 * margin_ratio)
+    margin_x = w * margin_ratio
+    margin_y = h * margin_ratio
+
+    scale_x = usable_w / total_width_cm
+    scale_y = usable_h / total_height_cm
+    scale = min(scale_x, scale_y)
+
+    def to_px(x_cm, y_cm):
+        px = margin_x + x_cm * scale
+        py = margin_y + y_cm * scale
+        return int(px), int(py)
+
+    font_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+        "fonts", "NotoSans-Variable.ttf"
+    )
+
+    try:
+        if os.path.exists(font_path):
+            font_code = ImageFont.truetype(font_path, max(12, int(w * 0.013)))
+            font_name = ImageFont.truetype(font_path, max(10, int(w * 0.010)))
+        else:
+            raise FileNotFoundError
+    except (OSError, FileNotFoundError):
+        font_code = ImageFont.load_default()
+        font_name = font_code
+
+    for room in rooms:
+        cx, cy = to_px(
+            room.x_cm + room.width_cm / 2,
+            room.y_cm + room.height_cm / 2,
+        )
+        code = getattr(room, "room_code", "") or ""
+
+        rt = (room.room_type or "").lower()
+        if language == "fr":
+            name = ROOM_NAMES_FR.get(rt, room.name)
+        else:
+            name = room.name
+
+        bg_pad = int(w * 0.003)
+        text_w_code = draw.textlength(code, font=font_code) if code else 0
+        text_w_name = draw.textlength(name, font=font_name)
+        text_block_w = int(max(text_w_code, text_w_name) + bg_pad * 3)
+        text_block_h = (font_code.size + 2 + font_name.size + bg_pad * 2) if code else (font_name.size + bg_pad * 2)
+
+        bg_x = cx - text_block_w // 2
+        bg_y = cy - text_block_h // 2
+
+        draw.rounded_rectangle(
+            [bg_x, bg_y, bg_x + text_block_w, bg_y + text_block_h],
+            radius=3, fill=(0, 0, 0, 140),
+        )
+
+        text_y = bg_y + bg_pad
+        if code:
+            draw.text(
+                (cx, text_y), code, font=font_code,
+                fill=(255, 255, 255, 230), anchor="mt",
+            )
+            text_y += font_code.size + 2
+            draw.text(
+                (cx, text_y), name, font=font_name,
+                fill=(200, 200, 200, 220), anchor="mt",
+            )
+        else:
+            draw.text(
+                (cx, text_y), name, font=font_name,
+                fill=(255, 255, 255, 230), anchor="mt",
+            )
+
+    _draw_watermark(img, w, h)
+
+    img = Image.alpha_composite(img, overlay)
     img = img.convert("RGB")
 
     buf = io.BytesIO()

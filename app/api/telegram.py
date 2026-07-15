@@ -63,6 +63,8 @@ class PdfUrlRequest(BaseModel):
 
 @router.post("/telegram/webhook")
 async def telegram_webhook(update: TelegramUpdate):
+    if not bot:
+        return {"ok": True, "error": "Telegram not configured"}
     from telegram import Update as TgUpdate
 
     tg_update = TgUpdate.de_json(update.model_dump(), bot)
@@ -121,11 +123,12 @@ async def link_telegram(request: LinkRequest, user=Depends(verify_token)):
     if not success:
         raise HTTPException(status_code=500, detail="Failed to link account.")
 
-    await bot.send_message(
-        chat_id=chat_id,
-        text="✅ *Account linked successfully!*\n\nYou can now receive your projects directly here.",
-        parse_mode="Markdown",
-    )
+    if bot:
+        await bot.send_message(
+            chat_id=chat_id,
+            text="✅ *Account linked successfully!*\n\nYou can now receive your projects directly here.",
+            parse_mode="Markdown",
+        )
 
     return {"ok": True}
 
