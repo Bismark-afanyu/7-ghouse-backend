@@ -228,7 +228,7 @@ def _render_3d_view(layout: FloorPlanLayout, isometric: bool = True):
         linewidths=0.6, alpha=0.7,
     ))
 
-    if layout.roof_type != "flat":
+    if not layout.roof_type.startswith("flat"):
         rise = _roof_rise(layout, layout.total_width_cm)
         ridge_x = layout.total_width_cm / 2
 

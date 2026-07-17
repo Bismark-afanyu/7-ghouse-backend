@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 MAX_VIEW_RETRIES = 3
 RETRY_BASE_DELAY = 2.0
+GEMINI_CALL_TIMEOUT = 180  # seconds per Gemini API call attempt
 
 
 def get_views_to_generate(property_type: str, multi_story: bool = False, num_stories: int = 1) -> list[str]:
@@ -76,7 +77,11 @@ def build_prompt(
         "Maintain a clean, premium interior design look with photorealistic materials and textures, high detail, interior design visualization quality, no text, no UI elements."
     )
 
-    roof_desc = f"{roof_type.lower()}-roofed" if roof_type.lower() != "flat" else "flat-roofed"
+    roof_lower = roof_type.lower()
+    if roof_lower.startswith("flat"):
+        roof_desc = "flat-roofed"
+    else:
+        roof_desc = f"{roof_lower}-roofed"
 
     story_text = f"{num_stories}-story" if num_stories > 1 else "single-story"
     architectural_dna = (
@@ -159,11 +164,23 @@ def build_prompt(
             "Since this is a single-story home, there are no stairs. The section focuses on the clean single-level layout. "
         )
 
+    flat_detail = ""
+    if roof_type.lower().startswith("flat") and "buildable" in roof_type.lower():
+        flat_detail = (
+            "The flat roof is a reinforced concrete slab designed to support future construction above, "
+            "show visible column rebar stubs extending above the slab for future column continuity. "
+        )
+    elif roof_type.lower().startswith("flat") and "non-buildable" in roof_type.lower():
+        flat_detail = (
+            "The flat roof is a standard waterproofed terrace slab, no structural provisions for future upward expansion. "
+        )
+
     cross_section_prompt = (
         f"A professional architectural cross-section rendering through a {story_text} {property_type.lower()} "
         f"with a {roof_type.lower()} roof on a {land_size} plot. "
         f"{story_info} "
         f"The building has a {roof_type.lower()} roof structure clearly visible in the section cut. "
+        f"{flat_detail}"
         "The section cut passes through the building showing interior spaces from the side, "
         "revealing the vertical organization of rooms. "
         f"{section_detail}"
@@ -411,7 +428,20 @@ async def generate_images_stream(
                         config=types.GenerateContentConfig(response_modalities=["Image", "Text"])
                     )
                 t0 = time.monotonic()
-                response = await asyncio.to_thread(call)
+                try:
+                    response = await asyncio.wait_for(asyncio.to_thread(call), timeout=GEMINI_CALL_TIMEOUT)
+                except asyncio.TimeoutError:
+                    elapsed = time.monotonic() - t0
+                    logger.warning(
+                        "[Gemini] %s: call timed out after %.1fs (attempt %d/%d)",
+                        view_label, elapsed, attempt + 1, 1 + MAX_VIEW_RETRIES,
+                    )
+                    last_error = f"timeout_{GEMINI_CALL_TIMEOUT}s"
+                    if attempt < MAX_VIEW_RETRIES:
+                        delay = RETRY_BASE_DELAY * (2 ** attempt)
+                        await asyncio.sleep(delay)
+                        continue
+                    return None
                 elapsed = time.monotonic() - t0
 
                 candidates = getattr(response, "candidates", None) or []

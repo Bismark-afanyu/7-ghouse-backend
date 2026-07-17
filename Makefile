@@ -26,6 +26,7 @@ deploy:
 		--region europe-west1 \
 		--allow-unauthenticated \
 		--memory 4Gi \
+		--timeout 3600 \
 		--project g-house-d458c
 
 set-env:

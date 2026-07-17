@@ -80,7 +80,7 @@ async def estimate_construction_cost(
     terrain_category: str = "flat",
 ) -> CostEstimate:
     stories = max(1, num_stories)
-    is_pitched = roof_type.lower() not in ("flat", "slab")
+    is_pitched = not roof_type.lower().startswith("flat") and roof_type.lower() != "slab"
 
     quality = quality_tier if quality_tier in ("basic", "standard", "premium") else "standard"
     transport_mul = get_transport_multiplier(region, division)

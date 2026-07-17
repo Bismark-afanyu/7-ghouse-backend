@@ -133,7 +133,7 @@ def _draw_section(ax, layout: FloorPlanLayout, cut_y_cm: float, title: str):
 
         prev_x = rx1
 
-    if layout.roof_type != "flat":
+    if not layout.roof_type.startswith("flat"):
         pitch_rad = math.radians(layout.roof_pitch_degrees)
         ridge_y = wh + rise
 

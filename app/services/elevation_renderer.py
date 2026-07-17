@@ -191,7 +191,7 @@ def _draw_roof(ax, layout: FloorPlanLayout, wall_side: str, total_span_cm: float
             _hip_roof_front(ax, layout, total_span_cm)
         else:
             _hip_roof_side(ax, layout, total_span_cm)
-    elif roof_type == "flat":
+    elif roof_type.startswith("flat"):
         _flat_roof(ax, layout, total_span_cm)
     elif roof_type == "pitched":
         if is_front_or_rear:

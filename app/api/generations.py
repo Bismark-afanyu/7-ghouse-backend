@@ -26,6 +26,7 @@ import uuid
 import os
 import asyncio
 import base64
+import json
 from typing import Optional
 from typing import List
 
@@ -42,8 +43,6 @@ async def cancel_generation(request: dict, user=Depends(verify_token)):
         return {"status": "cancelled"}
     return {"status": "not_found"}
 
-
-import json
 
 def _build_house_plan_prompt(
     request: GenerationRequest,
@@ -197,6 +196,7 @@ async def generate_design(request: GenerationRequest, user=Depends(verify_token)
         generation_id = uuid.uuid4().hex
         _cancel_events[generation_id] = cancel_event
         layout_task = None
+        workspace_sent = False
         try:
             uploaded_images = []
             prompt_used = ""
@@ -313,67 +313,115 @@ async def generate_design(request: GenerationRequest, user=Depends(verify_token)
                 except Exception as e:
                     logger.warning(f"Failed to decode reference image: {e}")
 
-            async for event in ai_service.generate_images_stream(
-                property_type=f"{request.house_style} Residence",
-                num_rooms=request.num_bedrooms,
-                land_size=f"{request.gross_area} m²",
-                architectural_style=request.house_style,
-                additional_preferences=enriched_prompt,
-                is_multi_story=request.is_multi_story,
-                num_stories=request.num_stories or 1,
-                roof_type=request.roof_type,
-                cancel_event=cancel_event,
-                overlay_language="en",
-                num_bathrooms=int(request.num_bathrooms),
-                num_kitchens=request.num_kitchens,
-                num_living_rooms=request.num_living_rooms,
-                kitchen_type=request.kitchen_type,
-                key_rooms=request.key_rooms,
-                outdoor_spaces=request.outdoor_spaces,
-                building_type=request.building_type,
-                layout=None,
-                layout_task=layout_task,
-                reference_image_bytes=reference_image_bytes,
-                reference_mime_type=reference_mime_type,
-                reference_analysis=request.reference_analysis,
-            ):
-                if event["type"] == "view_list":
-                    yield f"data: {json.dumps({'status': 'view_list', 'views': event.get('views', [])})}\n\n"
+            # --- Queue-based producer/consumer with heartbeat keepalive ---
+            _STREAM_DONE = object()
+            _HEARTBEAT = object()
+            event_queue: asyncio.Queue = asyncio.Queue()
 
-                elif event["type"] in ["progress", "view_start", "view_complete", "view_error", "error"]:
-                    yield f"data: {json.dumps({'status': event['type'], **event})}\n\n"
-                    if event["type"] == "error":
-                        return
-                
-                elif event["type"] == "cancelled":
-                    yield f"data: {json.dumps({'status': 'cancelled'})}\n\n"
+            async def _producer():
+                try:
+                    async for event in ai_service.generate_images_stream(
+                        property_type=f"{request.house_style} Residence",
+                        num_rooms=request.num_bedrooms,
+                        land_size=f"{request.gross_area} m²",
+                        architectural_style=request.house_style,
+                        additional_preferences=enriched_prompt,
+                        is_multi_story=request.is_multi_story,
+                        num_stories=request.num_stories or 1,
+                        roof_type=request.roof_type,
+                        cancel_event=cancel_event,
+                        overlay_language="en",
+                        num_bathrooms=int(request.num_bathrooms),
+                        num_kitchens=request.num_kitchens,
+                        num_living_rooms=request.num_living_rooms,
+                        kitchen_type=request.kitchen_type,
+                        key_rooms=request.key_rooms,
+                        outdoor_spaces=request.outdoor_spaces,
+                        building_type=request.building_type,
+                        layout=None,
+                        layout_task=layout_task,
+                        reference_image_bytes=reference_image_bytes,
+                        reference_mime_type=reference_mime_type,
+                        reference_analysis=request.reference_analysis,
+                    ):
+                        await event_queue.put(event)
+                except Exception as e:
+                    logger.exception("AI stream producer error for %s", generation_id)
+                    await event_queue.put({"type": "error", "message": str(e)})
+                finally:
+                    await event_queue.put(_STREAM_DONE)
+
+            async def _heartbeat():
+                try:
+                    while True:
+                        await asyncio.sleep(30)
+                        await event_queue.put(_HEARTBEAT)
+                except asyncio.CancelledError:
                     return
-                
-                elif event["type"] == "master_prompt":
-                    prompt_used = event["prompt"]
-                
-                elif event["type"] == "image":
-                    label_str = event["label"]
-                    yield f"data: {json.dumps({'status': 'progress', 'progress_type': 'uploading', 'label': label_str})}\n\n"
 
-                    if cancel_event.is_set():
+            producer_task = asyncio.create_task(_producer())
+            heartbeat_task = asyncio.create_task(_heartbeat())
+
+            try:
+                while True:
+                    event = await event_queue.get()
+
+                    if event is _STREAM_DONE:
+                        break
+
+                    if event is _HEARTBEAT:
+                        yield f": heartbeat\n\n"
+                        continue
+
+                    if event["type"] == "view_list":
+                        yield f"data: {json.dumps({'status': 'view_list', 'views': event.get('views', [])})}\n\n"
+
+                    elif event["type"] in ["progress", "view_start", "view_complete", "view_error", "error"]:
+                        yield f"data: {json.dumps({'status': event['type'], **event})}\n\n"
+                        if event["type"] == "error":
+                            return
+
+                    elif event["type"] == "cancelled":
                         yield f"data: {json.dumps({'status': 'cancelled'})}\n\n"
                         return
-                    
-                    img_data = await storage_service.upload_image(
-                        image_bytes=event["bytes"],
-                        user_id=user_id,
-                        generation_id=generation_id,
-                        index=idx,
-                    )
-                    idx += 1
-                    
-                    uploaded_images.append({
-                        "url": img_data["url"],
-                        "storage_path": img_data["storage_path"],
-                        "label": event["label"]
-                    })
-                    
+
+                    elif event["type"] == "master_prompt":
+                        prompt_used = event["prompt"]
+
+                    elif event["type"] == "image":
+                        label_str = event["label"]
+                        yield f"data: {json.dumps({'status': 'progress', 'progress_type': 'uploading', 'label': label_str})}\n\n"
+
+                        if cancel_event.is_set():
+                            yield f"data: {json.dumps({'status': 'cancelled'})}\n\n"
+                            return
+
+                        img_data = await storage_service.upload_image(
+                            image_bytes=event["bytes"],
+                            user_id=user_id,
+                            generation_id=generation_id,
+                            index=idx,
+                        )
+                        idx += 1
+
+                        uploaded_images.append({
+                            "url": img_data["url"],
+                            "storage_path": img_data["storage_path"],
+                            "label": event["label"]
+                        })
+            finally:
+                heartbeat_task.cancel()
+                try:
+                    await heartbeat_task
+                except asyncio.CancelledError:
+                    pass
+                if not producer_task.done():
+                    producer_task.cancel()
+                    try:
+                        await producer_task
+                    except asyncio.CancelledError:
+                        pass
+
             if not uploaded_images:
                 yield f"data: {json.dumps({'status': 'error', 'detail': 'All views failed to generate. Check backend logs for details.'})}\n\n"
                 return
@@ -439,17 +487,29 @@ async def generate_design(request: GenerationRequest, user=Depends(verify_token)
                 "cost_estimate": cost_estimate,
             }
             yield f"data: {json.dumps({'status': 'complete', 'workspace': workspace_payload})}\n\n"
+            workspace_sent = True
 
         except Exception as e:
             logger.exception("Generation stream failed for %s", generation_id)
             error_payload = {"status": "error", "detail": f"Generation failed: {str(e)}"}
             yield f"data: {json.dumps(error_payload)}\n\n"
+            workspace_sent = True  # prevent duplicate error in finally
         finally:
+            if not workspace_sent:
+                logger.error("Stream closing without workspace for %s — sending error fallback", generation_id)
+                try:
+                    yield f"data: {json.dumps({'status': 'error', 'detail': 'Stream closed before workspace was delivered. Please retry.'})}\n\n"
+                except Exception:
+                    pass
             _cancel_events.pop(generation_id, None)
             if layout_task and not layout_task.done():
                 layout_task.cancel()
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+    )
 
 
 
