@@ -6,7 +6,7 @@ dev:
 	$(VENV_BIN)/uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 
 prod:
-	uvicorn app.main:app --host 0.0.0.0 --port $(PORT) --workers 4
+	uvicorn app.main:app --host 0.0.0.0 --port $(PORT) --workers 1
 
 install:
 	$(VENV_BIN)/pip install -r requirements.txt

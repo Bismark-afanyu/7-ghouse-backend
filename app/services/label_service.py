@@ -205,6 +205,17 @@ def overlay_labels(
 
     config = get_label_config(view_type)
 
+    if view_type.startswith("zone_"):
+        # Zone views get a dynamic title banner from the zone definition
+        from app.services.ai_service import get_interior_zones
+        zone = next(
+            (z for z in get_interior_zones(num_bedrooms, kitchen_type) if z["key"] == view_type),
+            None,
+        )
+        title = zone["title"] if zone else "Interior"
+        from app.schemas.labels import ViewLabelConfig
+        config = ViewLabelConfig(show_title_banner=True, title_en=title, title_fr=title)
+
     if config.show_title_banner and config.title_en:
         _draw_title_banner(img, draw, config, w, h, language)
 
@@ -400,6 +411,59 @@ def overlay_room_labels(
     img = Image.alpha_composite(img, overlay)
     img = img.convert("RGB")
 
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def slice_quadrants(image_bytes: bytes) -> list[bytes]:
+    """Slice a 2x2 grid composite into its four quadrant tiles.
+
+    Returns tiles in reading order: top-left, top-right, bottom-left, bottom-right.
+    """
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    w, h = img.size
+    half_w, half_h = w // 2, h // 2
+    boxes = [(0, 0, half_w, half_h), (half_w, 0, w, half_h), (0, half_h, half_w, h), (half_w, half_h, w, h)]
+    tiles = []
+    for box in boxes:
+        tile = img.crop(box)
+        buf = io.BytesIO()
+        tile.save(buf, format="PNG")
+        tiles.append(buf.getvalue())
+    return tiles
+
+
+def label_zone_tile(image_bytes: bytes, zone_title: str, angle_no: int, language: str = "en") -> bytes:
+    """Overlay a small corner chip + watermark on a single zone angle tile."""
+    angle_labels = {
+        "en": ["Entrance", "Corner", "Window", "Opposite"],
+        "fr": ["Entrée", "Coin", "Fenêtre", "Opposé"],
+    }
+    angles = angle_labels.get(language, angle_labels["en"])
+    angle_text = angles[angle_no - 1] if 0 < angle_no <= len(angles) else f"{angle_no}"
+
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    w, h = img.size
+
+    text = f"{zone_title} — {angle_text}"
+    font = _load_font_bold(max(16, w // 42))
+    pad = max(8, w // 160)
+    tw, th = _get_text_size(draw, text, font)
+    chip_h = th + pad * 2
+    chip_w = tw + pad * 2
+
+    draw.rounded_rectangle(
+        [pad, pad, pad + chip_w, pad + chip_h],
+        radius=max(6, chip_h // 4),
+        fill=(20, 20, 20, 170),
+    )
+    draw.text((pad + pad // 2 + 2, pad + chip_h // 2), text, font=font, fill=(255, 255, 255, 235), anchor="lm")
+
+    _draw_watermark(img, w, h)
+    img = Image.alpha_composite(img, overlay).convert("RGB")
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()

@@ -102,12 +102,18 @@ async def generate_floor_plan_layout(
         land_length=land_length, land_width=land_width,
         num_kitchens=num_kitchens, num_living_rooms=num_living_rooms,
     )
+
     if layout is not None and _validate_layout(layout):
         layout = _self_heal_layout(layout)
         _add_building_openings(layout)
         _assign_room_codes(layout)
-        _set_cache(ck, layout)
-        return layout
+        if _layout_quality_ok(layout):
+            _set_cache(ck, layout)
+            return layout
+        print("[Layout] AI layout rejected by quality gate (fill/aspect/size); using deterministic grid")
+        layout = None
+
+    layout = _deterministic_layout(num_bedrooms, num_bathrooms, kitchen_type, extras, gross_area, land_length, land_width, num_kitchens=num_kitchens, num_living_rooms=num_living_rooms)
 
     layout = _deterministic_layout(num_bedrooms, num_bathrooms, kitchen_type, extras, gross_area, land_length, land_width, num_kitchens=num_kitchens, num_living_rooms=num_living_rooms)
     layout = _self_heal_layout(layout)
@@ -176,7 +182,7 @@ async def _try_gemini_layout_multi(
     prompt = (
         "You are an expert architectural space planner. Generate exactly TWO alternative "
         "rectangular single-story floor plan layouts as a JSON array. "
-        "Output ONLY the JSON array — no markdown, no explanations.\n\n"
+        "Output ONLY the JSON array  no markdown, no explanations.\n\n"
         "REQUIREMENTS:\n"
         f"- Bedrooms: {num_bedrooms} (includes 1 master bedroom)\n"
         f"- Bathrooms: {num_bathrooms}\n"
@@ -221,23 +227,38 @@ async def _try_gemini_layout_multi(
         "Generate two valid, realistic, distinct floor plans now as a JSON array."
     )
 
-    models_to_try = ["gemini-2.5-flash", "gemini-3.1-flash-lite"]
+    models_to_try = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
 
     for model_name in models_to_try:
+        text = None
+        for attempt in range(4):
+            try:
+                def call(m=model_name):
+                    return client.models.generate_content(
+                        model=m,
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            temperature=0.4,
+                            response_mime_type="application/json",
+                        ),
+                    )
+
+                response = await asyncio.to_thread(call, model_name)
+                text = response.text.strip()
+                break
+            except Exception as e:
+                error_str = str(e)
+                if attempt < 3:
+                    delay = 15.0 * (3 ** attempt) if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str else 2.0 * (2 ** attempt)
+                    print(f"Gemini Error layout_multi {model_name} (attempt {attempt+1}): {e}. Retrying in {delay}s...")
+                    await asyncio.sleep(delay)
+                else:
+                    print(f"Gemini Error layout_multi {model_name} (final attempt {attempt+1}): {e}")
+                    
+        if not text:
+            continue
+
         try:
-            def call(m=model_name):
-                return client.models.generate_content(
-                    model=m,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        temperature=0.4,
-                        response_mime_type="application/json",
-                    ),
-                )
-
-            response = await asyncio.to_thread(call, model_name)
-            text = response.text.strip()
-
             data = json.loads(text)
             if isinstance(data, dict):
                 variants = [data]
@@ -327,6 +348,53 @@ def _validate_layout(layout: FloorPlanLayout) -> bool:
     return True
 
 
+def _layout_quality_ok(layout: FloorPlanLayout) -> bool:
+    """Presentation-quality gate for AI-proposed layouts.
+
+    The plan-sheet renderer drafts whatever geometry it receives, so a
+    fragmented AI layout (low fill ratio, sliver rooms, extreme envelope)
+    becomes immediately visible. Layouts failing these gates fall back to
+    the deterministic grid, which always tiles cleanly.
+    """
+    w, h = layout.total_width_cm, layout.total_height_cm
+    envelope_m2 = (w * h) / 10000
+    rooms_m2 = sum((r.width_cm * r.height_cm) / 10000 for r in layout.rooms)
+
+    if envelope_m2 <= 0:
+        return False
+    fill = rooms_m2 / envelope_m2
+    if fill < 0.80:
+        return False
+
+    aspect = max(w, h) / max(1.0, min(w, h))
+    if aspect > 2.4:
+        return False
+
+    for r in layout.rooms:
+        rt = (r.room_type or "").lower()
+        name = (r.name or "").lower()
+        is_wet = "bath" in rt or "wc" in rt
+        # Circulation spaces legitimately run long and narrow — exempt them
+        is_circulation = ("hall" in rt or "corridor" in rt or "stair" in rt
+                          or "hall" in name or "corridor" in name or "escalier" in name
+                          or "utility" in rt)
+        if is_wet:
+            if (r.width_cm * r.height_cm) / 10000 < 1.5:
+                return False
+            continue
+        if is_circulation:
+            continue
+        # Habitable rooms: sensible minimums and proportions
+        area = (r.width_cm * r.height_cm) / 10000
+        if area < 4.5:
+            return False
+        r_aspect = max(r.width_cm, r.height_cm) / max(1.0, min(r.width_cm, r.height_cm))
+        if r_aspect > 3.5:
+            return False
+
+    return True
+
+
 def validate_feasibility(
     num_bedrooms: int = 3,
     num_bathrooms: int = 2,
@@ -403,6 +471,63 @@ def _wall_length(w: dict) -> float:
     return ((w["x2"] - w["x1"]) ** 2 + (w["y2"] - w["y1"]) ** 2) ** 0.5
 
 
+def _wall_span(w: dict, side: str) -> tuple[float, float]:
+    """Return (start, end) coordinate along a wall in the wall's own axis."""
+    if side in ("top", "bottom"):
+        return (min(w["x1"], w["x2"]), max(w["x1"], w["x2"]))
+    return (min(w["y1"], w["y2"]), max(w["y1"], w["y2"]))
+
+
+def _room_wall_extent(room: RoomLayout, side: str) -> tuple[float, float, float]:
+    """Return (fixed_coord, start, end) of a room's wall on `side`.
+
+    For top/bottom, fixed_coord is the y of the wall and start/end are x.
+    For left/right, fixed_coord is the x of the wall and start/end are y.
+    """
+    if side == "top":
+        return (room.y_cm, room.x_cm, room.x_cm + room.width_cm)
+    if side == "bottom":
+        return (room.y_cm + room.height_cm, room.x_cm, room.x_cm + room.width_cm)
+    if side == "left":
+        return (room.x_cm, room.y_cm, room.y_cm + room.height_cm)
+    return (room.x_cm + room.width_cm, room.y_cm, room.y_cm + room.height_cm)
+
+
+def _occupied_intervals(room: RoomLayout, side: str, start: float, end: float) -> list[tuple[float, float]]:
+    """Existing openings (plus clearance) on this room's wall, in wall-axis coords."""
+    iv = []
+    for op in (room.windows or []) + (room.doors or []):
+        if op.wall_side != side:
+            continue
+        # Window/door center is stored relative to the room edge start
+        iv.append((op.center_cm - op.width_cm / 2 - 30, op.center_cm + op.width_cm / 2 + 30))
+    return iv
+
+
+def _find_free_span(intervals: list[tuple[float, float]], start: float, end: float, need: float) -> Optional[float]:
+    """Find a free span of length `need` in [start, end]; prefer the center. Returns center or None."""
+    pad = 20.0
+    lo, hi = start + pad, end - pad
+    if hi - lo < need:
+        return None
+    clipped = sorted(
+        (max(a, lo), min(b, hi)) for a, b in intervals if b > lo and a < hi
+    )
+    free: list[tuple[float, float]] = []
+    cursor = lo
+    for a, b in clipped:
+        if a - cursor >= need:
+            free.append((cursor, a))
+        cursor = max(cursor, b)
+    if hi - cursor >= need:
+        free.append((cursor, hi))
+    if not free:
+        return None
+    mid = (lo + hi) / 2
+    best = min(free, key=lambda s: abs((s[0] + s[1]) / 2 - mid) - (s[1] - s[0]) * 0.001)
+    return (best[0] + best[1]) / 2
+
+
 def _add_building_openings(layout: FloorPlanLayout):
     walls = _build_wall_segments(layout)
 
@@ -411,6 +536,86 @@ def _add_building_openings(layout: FloorPlanLayout):
         room.doors = []
 
     exterior = [w for w in walls if not w["shared"]]
+    shared = [w for w in walls if w["shared"]]
+
+    # ── Entry door on the living room's exterior wall ────────────────────────
+    living = next((r for r in layout.rooms if r.room_type == "living"), None)
+    if living is None:
+        living = max(layout.rooms, key=lambda r: r.width_cm * r.height_cm)
+    entry_width = 110.0
+    for side_pref in ("bottom", "left", "right", "top"):
+        fixed, start, end = _room_wall_extent(living, side_pref)
+        is_ext = any(
+            w["side"] == side_pref and not w["shared"] and living in w["rooms"]
+            and abs(_room_wall_extent(living, side_pref)[0] - (w["y1"] if side_pref in ("top", "bottom") else w["x1"])) < 1
+            for w in exterior
+        )
+        if not is_ext:
+            continue
+        center = _find_free_span([], start, end, entry_width)
+        if center is not None:
+            living.doors.append(WallOpening(
+                wall_side=side_pref, center_cm=center - start,
+                width_cm=entry_width, height_cm=220.0, sill_height_cm=0,
+            ))
+            break
+
+    # ── Interior doors: BFS from the living room through shared walls ────────
+    adjacency: dict[int, list[tuple[RoomLayout, dict, str]]] = {}
+    for w in shared:
+        if len(w["rooms"]) < 2:
+            continue
+        a, b = w["rooms"][0], w["rooms"][1]
+        adjacency.setdefault(id(a), []).append((b, w, w["side"] if w["rooms"][0] is a else
+                                                ("top" if w["side"] == "bottom" else
+                                                 "bottom" if w["side"] == "top" else
+                                                 "left" if w["side"] == "right" else "right")))
+        adjacency.setdefault(id(b), []).append((a, w, w["side"] if w["rooms"][1] is b else
+                                                ("top" if w["side"] == "bottom" else
+                                                 "bottom" if w["side"] == "top" else
+                                                 "left" if w["side"] == "right" else "right")))
+
+    connected = {id(living): living}
+    queue = [living]
+    while queue:
+        current = queue.pop(0)
+        for neighbor, _w, side in adjacency.get(id(current), []):
+            if id(neighbor) not in connected:
+                connected[id(neighbor)] = neighbor
+                queue.append(neighbor)
+                # Place a door on this shared wall, in the neighbor's frame
+                fixed, start, end = _room_wall_extent(neighbor, side)
+                need = 70.0 if neighbor.room_type in ("bathroom", "wc") else 90.0
+                occupied = _occupied_intervals(neighbor, side, start, end)
+                center = _find_free_span(occupied, start, end, need)
+                if center is None and occupied:
+                    # Retry ignoring clearance pads
+                    center = _find_free_span([], start, end, need)
+                if center is not None:
+                    neighbor.doors.append(WallOpening(
+                        wall_side=side, center_cm=center - start,
+                        width_cm=need, height_cm=210.0, sill_height_cm=0,
+                    ))
+
+    # Any room still unreachable (rare, gapped layouts): door on longest shared wall
+    for room in layout.rooms:
+        if id(room) in connected:
+            continue
+        best_len, best = -1.0, None
+        for neighbor, w, side in adjacency.get(id(room), []):
+            fixed, start, end = _room_wall_extent(room, side)
+            if end - start > best_len:
+                best_len, best = end - start, (side, start, end)
+        if best:
+            side, start, end = best
+            center = _find_free_span([], start, end, 90.0)
+            if center is not None:
+                room.doors.append(WallOpening(
+                    wall_side=side, center_cm=center - start,
+                    width_cm=90.0, height_cm=210.0, sill_height_cm=0,
+                ))
+
+    # ── Windows on exterior walls, avoiding doors ────────────────────────────
     win_width = 120.0
     win_height = 150.0
     win_sill = 90.0
@@ -420,35 +625,31 @@ def _add_building_openings(layout: FloorPlanLayout):
         if length < 200:
             continue
 
-        n_wins = max(1, round(length / 400))
-        margin = length * 0.15
-        spacing = (length - 2 * margin) / n_wins
-
-        for wi in range(n_wins):
-            center = margin + spacing * (wi + 0.5)
-            for room in w["rooms"]:
-                opening = WallOpening(
-                    wall_side=w["side"],
-                    center_cm=center,
-                    width_cm=win_width,
-                    height_cm=win_height,
-                    sill_height_cm=win_sill,
-                )
-                room.windows.append(opening)
-
-    living_rooms = [r for r in layout.rooms if r.room_type == "living"]
-    if living_rooms:
-        lr = living_rooms[0]
-        door_width = 100.0
-        door_height = 220.0
-        door_pos = lr.width_cm * 0.25
-        lr.doors.append(WallOpening(
-            wall_side="bottom",
-            center_cm=door_pos,
-            width_cm=door_width,
-            height_cm=door_height,
-            sill_height_cm=0,
-        ))
+        for room in w["rooms"]:
+            fixed, start, end = _room_wall_extent(room, w["side"])
+            occupied = _occupied_intervals(room, w["side"], start, end)
+            n_target = max(1, round(length / 400))
+            placed = 0
+            margin = length * 0.12
+            step = (length - 2 * margin) / n_target if n_target else length
+            for wi in range(n_target):
+                approx_center = margin + step * (wi + 0.5)
+                # Snap search around the ideal position
+                probe_start, probe_end = start + margin, end - margin
+                if probe_end <= probe_start:
+                    continue
+                center = _find_free_span(occupied, probe_start, probe_end, win_width)
+                if center is None:
+                    continue
+                if abs((center - start) - approx_center) > step:
+                    continue  # free span is far from the ideal slot; skip
+                room.windows.append(WallOpening(
+                    wall_side=w["side"], center_cm=center - start,
+                    width_cm=win_width, height_cm=win_height, sill_height_cm=win_sill,
+                ))
+                occupied.append((center - start - win_width / 2 - 30,
+                                 center - start + win_width / 2 + 30))
+                placed += 1
 
     _validate_no_overlapping_openings(layout)
 
@@ -468,7 +669,19 @@ def _assign_room_codes(layout):
 
 
 def _validate_no_overlapping_openings(layout: FloorPlanLayout):
-    pass
+    """Drop later openings that physically overlap earlier ones on the same wall."""
+    for room in layout.rooms:
+        seen: list[tuple[str, float, float]] = []
+        for op_list in (room.doors, room.windows):
+            keep = []
+            for op in op_list:
+                a = op.center_cm - op.width_cm / 2
+                b = op.center_cm + op.width_cm / 2
+                if any(op.wall_side == s2 and a < b2 and b > a2 for s2, a2, b2 in seen):
+                    continue
+                seen.append((op.wall_side, a, b))
+                keep.append(op)
+            op_list[:] = keep
 
 
 def _self_heal_layout(layout: FloorPlanLayout) -> FloorPlanLayout:

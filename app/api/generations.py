@@ -1,10 +1,11 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Query, UploadFile, File
 from fastapi.responses import StreamingResponse, Response
-from app.core.auth_middleware import verify_token
-from app.schemas.generation import GenerationRequest, AnalyzePdfRequest, GenerationResponse, GenerationHistoryItem, WorkspaceResponse, SingleRoomRequest, SaveGenerationRequest, GenerationImage, GenerationUpdate, FloorPlanRequest, FloorPlanWorkspaceResponse, FloorPlanSpecification, SingleFloorPlanViewRequest, SaveFloorPlanRequest, CleanupRequest
+from app.core.auth_middleware import verify_token, require_admin
+from app.schemas.generation import GenerationRequest, AnalyzePdfRequest, GenerationResponse, GenerationHistoryItem, WorkspaceResponse, SingleRoomRequest, SaveGenerationRequest, GenerationImage, GenerationUpdate, FloorPlanRequest, FloorPlanWorkspaceResponse, FloorPlanSpecification, SingleFloorPlanViewRequest, SaveFloorPlanRequest, CleanupRequest, BudgetOnlyResponse, SaveBudgetOnlyRequest
 from app.services import ai_service, storage_service
 from app.services.floor_plan_layout import generate_floor_plan_layout
 from app.services.floor_plan_ai import render_floor_plan_ai as render_floor_plan
+from app.services import plan_sheet_renderer
 from app.services.elevation_renderer import render_elevations
 from app.services.cross_section_renderer import render_cross_section
 from app.services.three_d_renderer import render_3d_wireframe
@@ -16,8 +17,8 @@ import logging
 logger = logging.getLogger(__name__)
 
 _FLOOR_PLAN_VIEW_RENDERERS = {
-    "floor_plan_main": lambda l: render_floor_plan(l, annotated=False),
-    "floor_plan_annotated": lambda l: render_floor_plan(l, annotated=True),
+    "floor_plan_main": lambda l: plan_sheet_renderer.render_plan_sheet(l, style="bw", lang="en", project="7G House", sheet_no="A-101"),
+    "floor_plan_annotated": lambda l: plan_sheet_renderer.render_plan_sheet(l, style="color", lang="en", project="7G House", sheet_no="A-101"),
     "elevations_composite": lambda l: asyncio.to_thread(render_elevations, l),
     "roof_plan_view": lambda l: asyncio.to_thread(render_roof_plan, l),
     "floor_plan_3d": lambda l: asyncio.to_thread(render_3d_wireframe, l),
@@ -44,6 +45,204 @@ async def cancel_generation(request: dict, user=Depends(verify_token)):
     return {"status": "not_found"}
 
 
+@router.post("/generate/budget", response_model=BudgetOnlyResponse)
+async def generate_budget_only(request: GenerationRequest, user=Depends(verify_token)):
+    """Generate only the budget/cost estimate without AI design generation."""
+    user_id = user["uid"]
+    generation_id = uuid.uuid4().hex
+
+    try:
+        region_warning = None
+        resolved_lat = request.latitude
+        resolved_lng = request.longitude
+        resolved_location_name = request.location_name
+
+        if not resolved_lat or not resolved_lng:
+            if request.location_name:
+                try:
+                    from app.services.geocoding import geocode_location
+                    coords = await geocode_location(request.location_name)
+                    if coords:
+                        resolved_lat, resolved_lng = coords
+                except Exception as e:
+                    logger.warning(f"Geocoding failed: {e}")
+
+        if resolved_lat and resolved_lng:
+            try:
+                from app.data.cameroon_locations import validate_coords_in_region
+                warning = validate_coords_in_region(resolved_lat, resolved_lng, request.region, resolved_location_name)
+                if warning:
+                    region_warning = warning
+            except Exception as e:
+                logger.warning(f"Region validation failed: {e}")
+
+        terrain_info = None
+        if request.latitude and request.longitude:
+            try:
+                from app.services.terrain_service import get_terrain_data
+                ti = await get_terrain_data(request.latitude, request.longitude, request.region)
+                terrain_info = {
+                    "elevation_m": ti.elevation_m,
+                    "slope_category": ti.slope_category,
+                    "terrain_type": ti.terrain_type,
+                    "foundation_recommendation": ti.foundation_recommendation,
+                    "terrain_notes": ti.terrain_notes,
+                }
+            except Exception as e:
+                logger.warning(f"Terrain lookup failed: {e}")
+
+        cost_estimate = None
+        try:
+            from app.services.cost_estimation import estimate_construction_cost
+            gfa_val = float(request.gross_area) if request.gross_area else 150.0
+            ce = await estimate_construction_cost(
+                gross_area=gfa_val,
+                num_bedrooms=request.num_bedrooms,
+                num_bathrooms=request.num_bathrooms,
+                roof_type=request.roof_type,
+                is_multi_story=request.is_multi_story,
+                num_stories=request.num_stories or 1,
+                quality_tier="standard",
+                region=request.region,
+                division=request.division or None,
+                site_lat=request.latitude,
+                site_lng=request.longitude,
+                material_source_hub=request.material_source_hub or "",
+                custom_hub_name=request.custom_hub_name,
+                custom_hub_lat=request.custom_hub_lat,
+                custom_hub_lng=request.custom_hub_lng,
+                terrain_category=terrain_info.get("slope_category", "flat") if terrain_info else "flat",
+            )
+            cost_estimate = ce.model_dump()
+        except Exception as e:
+            logger.warning(f"Cost estimation failed: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Cost estimation failed: {str(e)}",
+            )
+
+        specification = {
+            "building_type": request.building_type,
+            "house_style": request.house_style,
+            "gross_area": request.gross_area,
+            "is_multi_story": request.is_multi_story,
+            "num_stories": request.num_stories,
+            "num_bedrooms": request.num_bedrooms,
+            "num_bathrooms": request.num_bathrooms,
+            "num_living_rooms": request.num_living_rooms,
+            "num_kitchens": request.num_kitchens,
+            "roof_type": request.roof_type,
+            "foundation": request.foundation,
+            "num_garages": request.num_garages,
+            "outdoor_spaces": request.outdoor_spaces,
+            "overall_layout": request.overall_layout,
+            "kitchen_type": request.kitchen_type,
+            "key_rooms": request.key_rooms,
+            "region": request.region,
+            "division": request.division,
+            "additional_preferences": request.additional_preferences,
+            "land_shape": request.land_shape,
+            "land_length": request.land_length,
+            "land_width": request.land_width,
+            "latitude": request.latitude,
+            "longitude": request.longitude,
+            "location_name": request.location_name,
+            "terrain_info": terrain_info,
+            "region_warning": region_warning,
+        }
+
+        return BudgetOnlyResponse(
+            generation_id=generation_id,
+            cost_estimate=cost_estimate,
+            specification=specification,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Budget estimation failed for %s", generation_id)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Budget estimation failed: {str(e)}",
+        )
+
+
+@router.post("/generation/save-budget", response_model=GenerationResponse)
+async def save_budget_only(request: SaveBudgetOnlyRequest, user=Depends(verify_token)):
+    """Save a budget-only estimate to the database."""
+    user_id = user["uid"]
+
+    try:
+        doc_id = await db_service.save_generation(
+            user_id=user_id,
+            client_name=request.client_name,
+            house_style=request.specification.get("house_style", ""),
+            gross_area=str(request.specification.get("gross_area", "")),
+            is_multi_story=request.specification.get("is_multi_story", False),
+            num_stories=request.specification.get("num_stories"),
+            num_bedrooms=request.specification.get("num_bedrooms", 0),
+            num_bathrooms=request.specification.get("num_bathrooms", 0),
+            roof_type=request.specification.get("roof_type", ""),
+            foundation=request.specification.get("foundation", ""),
+            num_garages=request.specification.get("num_garages", 0),
+            outdoor_spaces=request.specification.get("outdoor_spaces", []),
+            overall_layout=request.specification.get("overall_layout", ""),
+            kitchen_type=request.specification.get("kitchen_type", ""),
+            key_rooms=request.specification.get("key_rooms", []),
+            region=request.specification.get("region", "Center"),
+            division=request.specification.get("division", ""),
+            additional_preferences=request.specification.get("additional_preferences"),
+            prompt_used="budget_only",
+            images=[],
+            cost_estimate=request.cost_estimate,
+            room_measurements=[],
+            generation_type="budget_only",
+        )
+
+        return GenerationResponse(
+            id=doc_id,
+            client_name=request.client_name,
+            house_style=request.specification.get("house_style", ""),
+            gross_area=str(request.specification.get("gross_area", "")),
+            is_multi_story=request.specification.get("is_multi_story", False),
+            num_stories=request.specification.get("num_stories"),
+            num_bedrooms=request.specification.get("num_bedrooms", 0),
+            num_bathrooms=request.specification.get("num_bathrooms", 0),
+            roof_type=request.specification.get("roof_type", ""),
+            foundation=request.specification.get("foundation", ""),
+            num_garages=request.specification.get("num_garages", 0),
+            outdoor_spaces=request.specification.get("outdoor_spaces", []),
+            overall_layout=request.specification.get("overall_layout", ""),
+            kitchen_type=request.specification.get("kitchen_type", ""),
+            key_rooms=request.specification.get("key_rooms", []),
+            region=request.specification.get("region", "Center"),
+            division=request.specification.get("division", ""),
+            additional_preferences=request.specification.get("additional_preferences"),
+            images=[],
+            prompt_used="budget_only",
+            created_at="",
+            user_id=user_id,
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to save budget estimate: {str(e)}",
+        )
+
+
+def _plot_descriptor(request: GenerationRequest) -> str:
+    """Describe the real land plot for prompts (the building footprint is stated separately)."""
+    if request.land_length and request.land_width:
+        return f"{request.land_length:g}m × {request.land_width:g}m ({request.land_length * request.land_width:g} m²)"
+    if request.land_vertices and len(request.land_vertices) >= 3:
+        pts = request.land_vertices
+        area = abs(sum(
+            pts[i][0] * pts[(i + 1) % len(pts)][1] - pts[(i + 1) % len(pts)][0] * pts[i][1]
+            for i in range(len(pts))
+        )) / 2
+        return f"{area:g} m² irregular-shaped"
+    return "residential"
+
+
 def _build_house_plan_prompt(
     request: GenerationRequest,
     terrain_info: Optional[dict] = None,
@@ -51,7 +250,7 @@ def _build_house_plan_prompt(
     """Build a comprehensive prompt from the structured house plan request."""
     parts = []
 
-    # Core description — varies by building type
+    # Core description  varies by building type
     building_type = request.building_type or "single_family"
     story_text = f"{request.num_stories}-story" if request.is_multi_story and request.num_stories else "single-story"
 
@@ -166,6 +365,14 @@ def _build_house_plan_prompt(
     region_ctx = region_contexts.get(mapped_region, "")
     if region_ctx:
         parts.append(region_ctx)
+
+    # Cameroon construction vocabulary — keeps renders locally realistic
+    parts.append(
+        "Construction realism: sandcrete blockwork walls (15cm partitions, 20cm load-bearing) finished in cement plaster, "
+        "reinforced concrete strip/slab foundations, corrugated aluminium-zinc roofing sheets or clay tiles as suits the style, "
+        "large aluminium sliding or louvre windows for cross-ventilation, painted-render or stone-clad exterior finishes. "
+        "Show realistic Cameroonian residential detailing: compound setting, water storage tank, burglar-proofing on openings."
+    )
 
     # Terrain data from coordinates
     if terrain_info:
@@ -323,7 +530,7 @@ async def generate_design(request: GenerationRequest, user=Depends(verify_token)
                     async for event in ai_service.generate_images_stream(
                         property_type=f"{request.house_style} Residence",
                         num_rooms=request.num_bedrooms,
-                        land_size=f"{request.gross_area} m²",
+                        land_size=_plot_descriptor(request),
                         architectural_style=request.house_style,
                         additional_preferences=enriched_prompt,
                         is_multi_story=request.is_multi_story,
@@ -407,7 +614,8 @@ async def generate_design(request: GenerationRequest, user=Depends(verify_token)
                         uploaded_images.append({
                             "url": img_data["url"],
                             "storage_path": img_data["storage_path"],
-                            "label": event["label"]
+                            "label": event["label"],
+                            "view_key": event.get("view_key", ""),
                         })
             finally:
                 heartbeat_task.cancel()
@@ -496,7 +704,7 @@ async def generate_design(request: GenerationRequest, user=Depends(verify_token)
             workspace_sent = True  # prevent duplicate error in finally
         finally:
             if not workspace_sent:
-                logger.error("Stream closing without workspace for %s — sending error fallback", generation_id)
+                logger.error("Stream closing without workspace for %s  sending error fallback", generation_id)
                 try:
                     yield f"data: {json.dumps({'status': 'error', 'detail': 'Stream closed before workspace was delivered. Please retry.'})}\n\n"
                 except Exception:
@@ -605,14 +813,16 @@ async def generate_single_room(request: SingleRoomRequest, user=Depends(verify_t
                 extras=request.key_rooms + request.outdoor_spaces,
                 gross_area=request.gross_area,
             )
-            img_bytes = await render_floor_plan(layout, True)
+            img_bytes = await plan_sheet_renderer.render_plan_sheet(
+                layout, style="color", lang="en", project="7G House", sheet_no="A-101",
+            )
         else:
             enriched_prompt = _build_single_room_prompt(request)
     
             img_bytes = await ai_service.generate_single_view(
                 property_type=f"{request.house_style} Residence",
                 num_rooms=request.num_bedrooms,
-                land_size=f"{request.gross_area} m²",
+                land_size=_plot_descriptor(request),
                 architectural_style=request.house_style,
                 view_type=request.view_type,
                 additional_preferences=enriched_prompt,
@@ -637,7 +847,7 @@ async def generate_single_room(request: SingleRoomRequest, user=Depends(verify_t
             generation_id=request.generation_id,
             index=random_idx,
         )
-        
+
         return GenerationImage(
             url=img_data["url"],
             storage_path=img_data["storage_path"]
@@ -756,6 +966,30 @@ async def get_history(user=Depends(verify_token)):
         )
 
 
+@router.get("/admin/image-provider")
+async def get_image_provider_config(user=Depends(require_admin)):
+    """Current image-generation engine (admin-only comparison switch)."""
+    from app.services import image_provider
+    return image_provider.get_active_config()
+
+
+@router.post("/admin/image-provider")
+async def set_image_provider_config(request: dict, user=Depends(require_admin)):
+    """Switch the image-generation engine at runtime (admin-only).
+
+    Choices: gemini | nano-banana-2 | flare | sunburst | default (env config).
+    In-memory: reverts to the env-configured engine on process restart.
+    """
+    from app.services import image_provider
+    choice = (request or {}).get("choice", "")
+    try:
+        config = image_provider.set_engine(choice)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    logger.info("[Admin] %s switched image engine -> %s", user.get("uid"), config)
+    return config
+
+
 @router.get("/admin/all-history", response_model=list[GenerationHistoryItem])
 async def get_all_history(user=Depends(verify_token)):
     if user.get("role") != "admin":
@@ -804,10 +1038,34 @@ async def get_generation(generation_id: str, user=Depends(verify_token)):
                 "floor_plan_spec": spec,
                 "pdf_url": result.get("telegram_pdf_url", ""),
                 "pdf_generated_at": result.get("pdf_generated_at", ""),
-                "video_external_url": result.get("video_external_url", ""),
-                "video_internal_url": result.get("video_internal_url", ""),
-                "video_external_status": result.get("video_external_status", ""),
-                "video_internal_status": result.get("video_internal_status", ""),
+            }
+
+        if generation_type == "budget_only":
+            return {
+                "id": result["id"],
+                "generation_type": "budget_only",
+                "client_name": result.get("client_name"),
+                "house_style": result.get("house_style", ""),
+                "gross_area": result.get("gross_area", ""),
+                "is_multi_story": result.get("is_multi_story", False),
+                "num_stories": result.get("num_stories"),
+                "num_bedrooms": result.get("num_bedrooms", 0),
+                "num_bathrooms": result.get("num_bathrooms", 0),
+                "roof_type": result.get("roof_type", ""),
+                "foundation": result.get("foundation", ""),
+                "num_garages": result.get("num_garages", 0),
+                "outdoor_spaces": result.get("outdoor_spaces", []),
+                "overall_layout": result.get("overall_layout", ""),
+                "kitchen_type": result.get("kitchen_type", ""),
+                "key_rooms": result.get("key_rooms", []),
+                "region": result.get("region", "Center"),
+                "division": result.get("division", ""),
+                "additional_preferences": result.get("additional_preferences"),
+                "images": [],
+                "prompt_used": "budget_only",
+                "created_at": result.get("created_at", ""),
+                "user_id": result.get("user_id", user_id),
+                "cost_estimate": result.get("cost_estimate"),
             }
         
         return {
@@ -836,10 +1094,6 @@ async def get_generation(generation_id: str, user=Depends(verify_token)):
             "user_id": result.get("user_id", user_id),
             "pdf_url": result.get("telegram_pdf_url", ""),
             "pdf_generated_at": result.get("pdf_generated_at", ""),
-            "video_external_url": result.get("video_external_url", ""),
-            "video_internal_url": result.get("video_internal_url", ""),
-            "video_external_status": result.get("video_external_status", ""),
-            "video_internal_status": result.get("video_internal_status", ""),
         }
     except HTTPException:
         raise
@@ -1031,8 +1285,11 @@ async def generate_floor_plan(request: FloorPlanRequest, user=Depends(verify_tok
                         logger.warning(f"Failed to generate precise CAD data: {e}")
                         
                 elif view_key in ("floor_plan_main", "floor_plan_annotated"):
-                    annotated = view_key == "floor_plan_annotated"
-                    img_bytes = await render_floor_plan(layout, annotated)
+                    style = "color" if view_key == "floor_plan_annotated" else "bw"
+                    img_bytes = await plan_sheet_renderer.render_plan_sheet(
+                        layout, style=style, lang="en", project="7G House",
+                        sheet_no="A-101" if view_key == "floor_plan_main" else "A-102",
+                    )
                 elif view_key == "elevations_composite":
                     img_bytes = await asyncio.to_thread(render_elevations, layout)
                 elif view_key == "roof_plan_view":
@@ -1105,6 +1362,11 @@ async def generate_floor_plan(request: FloorPlanRequest, user=Depends(verify_tok
                 "dxf_url": dxf_url,
                 "room_measurements": room_measurements,
             }
+
+            if not uploaded_images:
+                yield f"data: {json.dumps({'status': 'error', 'detail': 'Floor plan generation failed: no views could be generated. Please try again.'})}\n\n"
+                return
+
             yield f"data: {json.dumps({'status': 'complete', 'workspace': workspace_payload})}\n\n"
 
         except Exception as e:
@@ -1185,10 +1447,6 @@ async def get_shared_generation(share_token: str):
                 "images": images,
                 "prompt_used": result.get("prompt_used", ""),
                 "created_at": result.get("created_at", ""),
-                "video_external_url": result.get("video_external_url", ""),
-                "video_internal_url": result.get("video_internal_url", ""),
-                "video_external_status": result.get("video_external_status", ""),
-                "video_internal_status": result.get("video_internal_status", ""),
             }
 
         images = [
@@ -1220,10 +1478,6 @@ async def get_shared_generation(share_token: str):
             "images": images,
             "prompt_used": result.get("prompt_used", ""),
             "created_at": result.get("created_at", ""),
-            "video_external_url": result.get("video_external_url", ""),
-            "video_internal_url": result.get("video_internal_url", ""),
-            "video_external_status": result.get("video_external_status", ""),
-            "video_internal_status": result.get("video_internal_status", ""),
         }
     except HTTPException:
         raise
@@ -1352,6 +1606,42 @@ async def download_generation_pdf(generation_id: str, lang: str = Query("en", pa
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"PDF generation failed: {str(e)}")
+
+
+@router.get("/generation/{generation_id}/docx")
+async def download_generation_docx(generation_id: str, lang: str = Query("en", pattern="^(en|fr)$"), user=Depends(verify_token)):
+    """
+    Build and stream a branded Word (.docx) report for the given generation.
+    Images are fetched server-side so there are no browser CORS issues.
+    """
+    from app.services.docx_service import build_project_docx, DOCX_MEDIA_TYPE
+
+    user_id = user["uid"]
+    is_admin = user.get("role") == "admin"
+
+    try:
+        result = await db_service.get_generation(generation_id, user_id, is_admin=is_admin)
+        if not result:
+            raise HTTPException(status_code=404, detail="Generation not found or access denied")
+
+        client_name = result.get("client_name") or result.get("house_style") or "Project"
+        safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in client_name)
+        filename = f"7G_House_{safe_name}_Report.docx"
+
+        docx_buf = await build_project_docx(result, lang=lang)
+        if not docx_buf:
+            raise HTTPException(status_code=500, detail="Failed to generate Word document")
+
+        docx_buf.seek(0)
+        return StreamingResponse(
+            docx_buf,
+            media_type=DOCX_MEDIA_TYPE,
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Word document generation failed: {str(e)}")
 
 
 @router.post("/generation/{generation_id}/pdf/upload")

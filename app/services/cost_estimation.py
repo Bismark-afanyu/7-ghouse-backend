@@ -148,14 +148,15 @@ async def estimate_construction_cost(
     add_item("Foundation & Concrete", "cement_slab_beams", "bags", struct_concrete_vol * 7, price("cement"))
     add_item("Foundation & Concrete", "gravel_struct", "m3", struct_concrete_vol * 0.55, price("gravel"))
     add_item("Foundation & Concrete", "sharp_sand_struct", "m3", struct_concrete_vol * 0.30, price("river_sand"))
-    add_item("Foundation & Concrete", "steel_12mm", "bars", struct_steel * 0.4 / 9.4, price("steel_12mm"))
-    add_item("Foundation & Concrete", "steel_10mm", "bars", struct_steel * 0.6 / 6.2, price("steel_10mm"))
+    add_item("Foundation & Concrete", "steel_12mm", "bars", struct_steel * 0.4 / 10.66, price("steel_12mm"))
+    add_item("Foundation & Concrete", "steel_10mm", "bars", struct_steel * 0.6 / 7.4, price("steel_10mm"))
     add_item("Foundation & Concrete", "binding_wire_struct", "kg", struct_steel * 0.015, price("binding_wire"))
     add_item("Foundation & Concrete", "formwork_plywood", "sheets", gross_area * stories * 0.04, price("formwork_plywood"))
     add_item("Foundation & Concrete", "formwork_timber", "lm", gross_area * stories * 0.5, price("formwork_timber"))
     add_item("Blockwork & Masonry", "wire_mesh", "rolls", gross_area * stories * 0.015, price("wire_mesh"))
 
-    wall_area = gross_area * 0.85 * stories
+    # ~1.7 m² of wall per m² of floor: perimeter + internal partitions, per floor
+    wall_area = gross_area * 1.7 * stories
     block_count = wall_area * 10
     mortar_vol = wall_area * 0.012
     mortar_cement = mortar_vol * 500 / 50
@@ -201,14 +202,17 @@ async def estimate_construction_cost(
     add_item("Finishing & Tiling", "cement_plaster", "bags", plaster_cement, price("cement_plaster"))
     add_item("Finishing & Tiling", "skirting", "lm", math.sqrt(gross_area) * 4 * 1.2, price("skirting"))
 
-    paint_area = plaster_area * 0.6
-    paint_liters = paint_area / 10
-    primer_liters = paint_area / 15
+    # Interior faces (external walls' inner side + both partition faces) vs the outer face
+    interior_paint_area = plaster_area - wall_area
+    exterior_paint_area = wall_area
+    interior_liters = interior_paint_area * 2.5 / 10  # ~2.5 coats at 10 m²/L
+    exterior_liters = exterior_paint_area * 2.0 / 10  # 2 coats
+    primer_liters = (interior_paint_area + exterior_paint_area) / 8  # 1 coat at 8 m²/L
 
-    add_item("Painting", "paint_interior", "pails", math.ceil(paint_liters / 10), price("paint_interior"))
-    add_item("Painting", "paint_exterior", "pails", math.ceil(gross_area * 0.15 / 10 + 1), price("paint_exterior"))
+    add_item("Painting", "paint_interior", "pails", math.ceil(interior_liters / 10), price("paint_interior"))
+    add_item("Painting", "paint_exterior", "pails", math.ceil(exterior_liters / 10), price("paint_exterior"))
     add_item("Painting", "paint_primer", "pails", math.ceil(primer_liters / 10), price("paint_primer"))
-    add_item("Painting", "putty", "bags", round(paint_area * 0.02), price("putty"))
+    add_item("Painting", "putty", "bags", round(plaster_area * 0.02), price("putty"))
 
     add_item("Plumbing & Sanitary", "wc_suite", "each", num_bathrooms + 1, price("wc_suite"))
     add_item("Plumbing & Sanitary", "washbasin", "each", num_bathrooms + 1, price("washbasin"))
@@ -244,7 +248,7 @@ async def estimate_construction_cost(
         distance_surcharge = round(material_subtotal * (distance_km / 500) * 0.03)
         transport_surcharge += distance_surcharge
 
-    labor_rate = 0.20 if quality == "basic" else (0.23 if quality == "standard" else 0.25)
+    labor_rate = 0.32 if quality == "basic" else (0.35 if quality == "standard" else 0.38)
     labor_cost = round(material_subtotal * labor_rate)
 
     terrain_factors = {"flat": 0.0, "gentle": 0.03, "moderate": 0.07, "steep": 0.12}

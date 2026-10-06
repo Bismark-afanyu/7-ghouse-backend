@@ -279,6 +279,7 @@ class GenerationHistoryItem(BaseModel):
     pdf_url: Optional[str] = None
     pdf_generated_at: Optional[str] = None
     dxf_url: Optional[str] = None
+    cost_estimate: Optional[dict] = None
 
 
 class GenerationUpdate(BaseModel):
@@ -339,3 +340,16 @@ class SaveFloorPlanRequest(BaseModel):
     prompt_used: str
     specification: FloorPlanSpecification
     room_measurements: list[dict] = Field(default_factory=list)
+
+
+class BudgetOnlyResponse(BaseModel):
+    generation_id: str
+    cost_estimate: dict
+    specification: dict
+
+
+class SaveBudgetOnlyRequest(BaseModel):
+    generation_id: str
+    client_name: Optional[str] = None
+    cost_estimate: dict
+    specification: dict

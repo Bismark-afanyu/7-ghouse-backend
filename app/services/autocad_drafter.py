@@ -265,18 +265,31 @@ async def generate_precise_layout_data(gross_area: str, bedrooms: int, bathrooms
     7. Windows: Distribute realistically sized windows on exterior walls to let light into the bedrooms, living room, and kitchen.
     """
     
-    def _call():
-        return client.models.generate_content(
-            model="gemini-2.5-pro",
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=PreciseFloorPlanSchema,
-                temperature=0.1,
-            ),
-        )
-        
-    response = await asyncio.to_thread(_call)
+    response = None
+    for attempt in range(4):
+        try:
+            def _call():
+                return client.models.generate_content(
+                    model="gemini-2.5-pro",
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=PreciseFloorPlanSchema,
+                        temperature=0.1,
+                    ),
+                )
+                
+            response = await asyncio.to_thread(_call)
+            break
+        except Exception as e:
+            error_str = str(e)
+            if attempt < 3:
+                delay = 15.0 * (3 ** attempt) if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str else 2.0 * (2 ** attempt)
+                print(f"Gemini Error generating floor plan (attempt {attempt+1}): {e}. Retrying in {delay}s...")
+                await asyncio.sleep(delay)
+            else:
+                print(f"Gemini Error generating floor plan (final attempt {attempt+1}): {e}")
+                raise e
     
     if not response.text:
         raise Exception("Failed to generate precise floor plan data")

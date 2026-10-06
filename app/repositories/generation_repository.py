@@ -64,12 +64,13 @@ async def save_generation(
     images: Optional[list[dict]] = None,
     cost_estimate: Optional[dict] = None,
     room_measurements: Optional[list[dict]] = None,
+    generation_type: str = "house_plan",
 ) -> str:
     db = _get_db()
     doc_ref = db.collection("generations").document()
     doc_ref.set({
         "user_id": user_id,
-        "generation_type": "house_plan",
+        "generation_type": generation_type,
         "client_name": client_name,
         "house_style": house_style,
         "gross_area": gross_area,
@@ -157,6 +158,7 @@ async def _execute_generation_query(query) -> list[dict]:
             "created_at": data.get("created_at", ""),
             "pdf_url": data.get("telegram_pdf_url", ""),
             "pdf_generated_at": data.get("pdf_generated_at", ""),
+            "cost_estimate": data.get("cost_estimate"),
         })
     return results
 
@@ -223,8 +225,6 @@ async def get_generation_by_id_for_telegram(generation_id: str) -> Optional[dict
         "images": images,
         "floor_plan_spec": data.get("floor_plan_spec", {}),
         "telegram_pdf_url": data.get("telegram_pdf_url", ""),
-        "video_external_url": data.get("video_external_url", ""),
-        "video_internal_url": data.get("video_internal_url", ""),
     }
 
 
@@ -262,45 +262,6 @@ async def delete_generation_pdf(generation_id: str) -> bool:
         return True
     except Exception as e:
         logger.error(f"Failed to delete generation pdf: {e}")
-        return False
-
-
-async def set_video_job_id(generation_id: str, job_id: str, video_type: str) -> bool:
-    db = _get_db()
-    try:
-        db.collection("generations").document(generation_id).update({
-            f"video_{video_type}_project_id": job_id,
-            f"video_{video_type}_status": "processing",
-        })
-        return True
-    except Exception as e:
-        logger.warning(f"Failed to set video_{video_type}_project_id: {e}")
-        return False
-
-
-async def set_video_url(generation_id: str, video_url: str, video_type: str = "external") -> bool:
-    db = _get_db()
-    try:
-        db.collection("generations").document(generation_id).update({
-            f"video_{video_type}_url": video_url,
-            f"video_{video_type}_status": "done",
-        })
-        return True
-    except Exception as e:
-        logger.warning(f"Failed to set video_{video_type}_url: {e}")
-        return False
-
-
-async def set_video_error(generation_id: str, video_type: str, message: str = "") -> bool:
-    db = _get_db()
-    try:
-        update = {f"video_{video_type}_status": "error"}
-        if message:
-            update[f"video_{video_type}_error"] = message
-        db.collection("generations").document(generation_id).update(update)
-        return True
-    except Exception as e:
-        logger.warning(f"Failed to set video_{video_type}_error: {e}")
         return False
 
 

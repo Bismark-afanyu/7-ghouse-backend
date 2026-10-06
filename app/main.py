@@ -16,7 +16,6 @@ from app.api.generations import router as generations_router
 from app.api.users import router as users_router
 from app.api.clients import router as clients_router
 from app.api.telegram import router as telegram_router
-from app.api.video import router as video_router
 
 app = FastAPI(
     title="7G House MVP API",
@@ -41,6 +40,10 @@ elif not os.getenv("ALLOWED_ORIGINS"):
     cors_kwargs["allow_origin_regex"] = r"https?://.*"
 
 app.add_middleware(CORSMiddleware, **cors_kwargs)
+
+# Announce the active image engine on boot so deploys are auditable in logs
+from app.services import image_provider
+logging.getLogger(__name__).info("Image generation engine: %s", image_provider.describe())
 
 
 @app.exception_handler(RequestValidationError)
@@ -98,4 +101,3 @@ app.include_router(generations_router, prefix="/api", tags=["generations"])
 app.include_router(users_router, prefix="/api/users", tags=["users"])
 app.include_router(clients_router, prefix="/api/clients", tags=["clients"])
 app.include_router(telegram_router, prefix="/api", tags=["telegram"])
-app.include_router(video_router, prefix="/api", tags=["video"])

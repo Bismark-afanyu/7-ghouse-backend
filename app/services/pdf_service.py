@@ -1,5 +1,5 @@
 """
-pdf_service.py — Server-side PDF generation for 7G House.
+pdf_service.py  Server-side PDF generation for 7G House.
 
 Builds a branded A4 PDF (landscape-safe) using Pillow + ImageDraw:
   • Page 1: Cover page with project specs
@@ -7,7 +7,7 @@ Builds a branded A4 PDF (landscape-safe) using Pillow + ImageDraw:
 
 Supports English and French (lang="en" | "fr").
 
-No browser CORS issues — images are fetched directly by the backend.
+No browser CORS issues  images are fetched directly by the backend.
 """
 
 import io
@@ -29,10 +29,10 @@ def _t(label: str, lang: str = "en") -> str:
     translations = {
         "header_title": ("7G HOUSE", "7G HOUSE"),
         "header_subtitle": ("CONSTRUCTION INTELLIGENCE REPORT", "RAPPORT D'INTELLIGENCE DE CONSTRUCTION"),
-        "footer_tagline": ("7G House Cameroon — Architectural Intelligence", "7G House Cameroun — Intelligence Architecturale"),
+        "footer_tagline": ("7G House Cameroon  Architectural Intelligence", "7G House Cameroun  Intelligence Architecturale"),
         "page": ("Page", "Page"),
         "project_report": ("PROJECT REPORT", "RAPPORT DE PROJET"),
-        "floor_plan_title": ("Floor Plan — {bedrooms}-Bedroom Project", "Plan d'Étage — Projet {bedrooms} Chambres"),
+        "floor_plan_title": ("Floor Plan  {bedrooms}-Bedroom Project", "Plan d'Étage  Projet {bedrooms} Chambres"),
         "house_design_title": ("{style} House Design", "Design Maison {style}"),
         "prepared_for": ("Prepared for: {client}", "Préparé pour : {client}"),
         "region": ("Region", "Région"),
@@ -223,25 +223,25 @@ def _build_cover_page(generation_data: dict, page_num: int = 1, lang: str = "en"
 
     if gen_type == "floor_plan":
         rows = [
-            (_labels["region"],   spec.get("region", "—")),
-            (_labels["division"], spec.get("division", "—")),
-            (_labels["bedrooms"], str(spec.get("num_bedrooms", "—"))),
-            (_labels["bathrooms"], str(spec.get("num_bathrooms", "—"))),
-            (_labels["gross_area"], f"{spec.get('gross_area', '—')} m²"),
-            (_labels["kitchen"],  str(spec.get("kitchen_type", "—")).capitalize()),
+            (_labels["region"],   spec.get("region", "")),
+            (_labels["division"], spec.get("division", "")),
+            (_labels["bedrooms"], str(spec.get("num_bedrooms", ""))),
+            (_labels["bathrooms"], str(spec.get("num_bathrooms", ""))),
+            (_labels["gross_area"], f"{spec.get('gross_area', '')} m²"),
+            (_labels["kitchen"],  str(spec.get("kitchen_type", "")).capitalize()),
         ]
         if extras := spec.get("extras"):
             rows.append((_labels["extras"], ", ".join(extras)))
     else:
         rows = [
-            (_labels["style"],      generation_data.get("house_style", "—")),
-            (_labels["region"],     generation_data.get("region", "—")),
-            (_labels["division"],   generation_data.get("division", "—")),
-            (_labels["bedrooms"],   str(generation_data.get("num_bedrooms", "—"))),
-            (_labels["bathrooms"],  str(generation_data.get("num_bathrooms", "—"))),
-            (_labels["gross_area"], f"{generation_data.get('gross_area', '—')} m²"),
-            (_labels["roof"],       generation_data.get("roof_type", "—")),
-            (_labels["foundation"], generation_data.get("foundation", "—")),
+            (_labels["style"],      generation_data.get("house_style", "")),
+            (_labels["region"],     generation_data.get("region", "")),
+            (_labels["division"],   generation_data.get("division", "")),
+            (_labels["bedrooms"],   str(generation_data.get("num_bedrooms", ""))),
+            (_labels["bathrooms"],  str(generation_data.get("num_bathrooms", ""))),
+            (_labels["gross_area"], f"{generation_data.get('gross_area', '')} m²"),
+            (_labels["roof"],       generation_data.get("roof_type", "")),
+            (_labels["foundation"], generation_data.get("foundation", "")),
         ]
         if ks := generation_data.get("key_rooms"):
             rows.append((_labels["key_rooms"], ", ".join(ks)))
@@ -281,7 +281,7 @@ def _build_cost_estimate_page(cost: dict, page_num: int = 2, lang: str = "en") -
         _draw_watermark(img, A4_W, A4_H)
         _draw_header(draw, A4_W, lang)
 
-        hub_name = cost.get("hub_name", "—")
+        hub_name = cost.get("hub_name", "")
         distance_km = cost.get("distance_km", 0)
         grand_total = cost.get("grand_total_fcfa", 0)
         grand_total_usd = cost.get("grand_total_usd", 0)
@@ -296,7 +296,7 @@ def _build_cost_estimate_page(cost: dict, page_num: int = 2, lang: str = "en") -
         # Hub info
         hub_line = f"{hub_name}"
         if distance_km > 0:
-            hub_line += f" — {distance_km:.0f} km {_t('cost_hub_distance', lang)}"
+            hub_line += f"  {distance_km:.0f} km {_t('cost_hub_distance', lang)}"
         draw.text((A4_W // 2, 180), hub_line,
                   font=_font(18), fill=CLR_MUTED, anchor="mt")
 
@@ -497,6 +497,8 @@ async def build_project_pdf(generation_data: dict, lang: str = "en") -> Optional
     or None on failure.
     """
     images: list[dict] = generation_data.get("images", [])
+    # Zone angle tiles duplicate the zone composite page — keep composites only
+    images = [img for img in images if not str(img.get("view_key", "")).endswith("_angle")]
     headers = {"User-Agent": "7G-House-PDF/1.0"}
 
     pages: list[Image.Image] = []

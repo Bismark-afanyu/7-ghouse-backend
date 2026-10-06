@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not TOKEN:
-    logger.warning("TELEGRAM_BOT_TOKEN not set — Telegram features disabled")
+    logger.warning("TELEGRAM_BOT_TOKEN not set  Telegram features disabled")
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
 
@@ -156,44 +156,6 @@ async def _send_welcome(chat_id: int) -> None:
     )
 
 
-async def _send_video_helper(chat_id: int, video_url: str, caption: str) -> None:
-    if not bot or not video_url:
-        return
-
-    # Try downloading and sending as a file buffer (bypasses 20MB URL limit, up to 50MB limit)
-    try:
-        import httpx
-        logger.info(f"Downloading video from {video_url} to send to Telegram...")
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            resp = await client.get(video_url, follow_redirects=True)
-            resp.raise_for_status()
-            video_bytes = io.BytesIO(resp.content)
-            video_bytes.name = "walkthrough.mp4"
-            await _send_with_retry(
-                bot.send_video,
-                chat_id=chat_id,
-                video=video_bytes,
-                caption=caption,
-                parse_mode="Markdown",
-            )
-            return
-    except Exception as e:
-        logger.warning(f"Failed to download and send video by bytes: {e}. Falling back to URL.")
-
-    # Fallback to direct URL sending (limited to 20MB by Telegram)
-    try:
-        await _send_with_retry(
-            bot.send_video,
-            chat_id=chat_id,
-            video=video_url,
-            caption=caption,
-            parse_mode="Markdown",
-        )
-    except Exception as e:
-        logger.error(f"Failed to send video by URL: {e}")
-        raise e
-
-
 async def _send_shared_project(chat_id: int, share_token: str) -> None:
     if not bot:
         return
@@ -208,8 +170,6 @@ async def _send_shared_project(chat_id: int, share_token: str) -> None:
         return
 
     images = result.get("images", [])
-    video_external_url = result.get("video_external_url", "")
-    video_internal_url = result.get("video_internal_url", "")
     share_url = f"{FRONTEND_URL}/shared?token={share_token}"
 
     pdf_sent = False
@@ -269,41 +229,10 @@ async def _send_shared_project(chat_id: int, share_token: str) -> None:
         if len(images) > 8:
             await bot.send_message(
                 chat_id=chat_id,
-                text=f"📸 *+{len(images) - 8} more images* — view them in the browser: {share_url}",
+                text=f"📸 *+{len(images) - 8} more images*  view them in the browser: {share_url}",
                 parse_mode="Markdown",
                 disable_web_page_preview=True,
             )
-
-    # 4. Send videos next if present
-    if video_external_url:
-        try:
-            await _send_video_helper(chat_id, video_external_url, "🎬 *Exterior Walkthrough*")
-        except Exception as e:
-            logger.warning(f"_send_shared_project: failed to send exterior video: {e}")
-            try:
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=f"🎬 *Exterior Walkthrough*\n📹 [Open Video]({video_external_url})",
-                    parse_mode="Markdown",
-                    disable_web_page_preview=False,
-                )
-            except Exception:
-                pass
-
-    if video_internal_url:
-        try:
-            await _send_video_helper(chat_id, video_internal_url, "🎬 *Interior Walkthrough*")
-        except Exception as e:
-            logger.warning(f"_send_shared_project: failed to send interior video: {e}")
-            try:
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=f"🎬 *Interior Walkthrough*\n📹 [Open Video]({video_internal_url})",
-                    parse_mode="Markdown",
-                    disable_web_page_preview=False,
-                )
-            except Exception:
-                pass
 
 
 async def send_project_to_chat(chat_id: int, generation_id: str) -> bool:
@@ -316,14 +245,10 @@ async def send_project_to_chat(chat_id: int, generation_id: str) -> bool:
         return False
 
     images = result.get("images", [])
-    video_external_url = result.get("video_external_url", "")
-    video_internal_url = result.get("video_internal_url", "")
     pdf_url = result.get("telegram_pdf_url", "")
 
     logger.info(
         f"Sending project {generation_id} to chat {chat_id}: "
-        f"ext_video={'yes' if video_external_url else 'no'}, "
-        f"int_video={'yes' if video_internal_url else 'no'}, "
         f"pdf={'yes' if pdf_url else 'no'}"
     )
 
@@ -378,36 +303,5 @@ async def send_project_to_chat(chat_id: int, generation_id: str) -> bool:
                 await _send_with_retry(bot.send_photo, chat_id=chat_id, photo=url)
             except Exception as e:
                 logger.warning(f"Failed to send image after retries: {e}")
-
-    # 4. Send videos next if present
-    if video_external_url:
-        try:
-            await _send_video_helper(chat_id, video_external_url, "🎬 *Exterior Walkthrough*")
-        except Exception as e:
-            logger.warning(f"Failed to send exterior video after retries: {e}")
-            try:
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=f"🎬 *Exterior Walkthrough*\n📹 [Open Video]({video_external_url})",
-                    parse_mode="Markdown",
-                    disable_web_page_preview=False,
-                )
-            except Exception:
-                pass
-
-    if video_internal_url:
-        try:
-            await _send_video_helper(chat_id, video_internal_url, "🎬 *Interior Walkthrough*")
-        except Exception as e:
-            logger.warning(f"Failed to send interior video after retries: {e}")
-            try:
-                await bot.send_message(
-                    chat_id=chat_id,
-                    text=f"🎬 *Interior Walkthrough*\n📹 [Open Video]({video_internal_url})",
-                    parse_mode="Markdown",
-                    disable_web_page_preview=False,
-                )
-            except Exception:
-                pass
 
     return True

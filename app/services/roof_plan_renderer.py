@@ -221,7 +221,7 @@ def render_roof_plan(layout: FloorPlanLayout) -> bytes:
     fig, ax = plt.subplots(1, 1, figsize=(16, 9))
 
     _draw_roof_plan(ax, layout,
-                    f"{layout.roof_type.capitalize()} Roof Plan  —  {layout.total_area_m2:.0f}m\u00b2 Footprint")
+                    f"{layout.roof_type.capitalize()} Roof Plan    {layout.total_area_m2:.0f}m\u00b2 Footprint")
 
     fig.patch.set_facecolor("white")
     plt.tight_layout(pad=1.0)

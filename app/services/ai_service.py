@@ -8,6 +8,7 @@ from google.genai import types
 from typing import Optional
 from app.services.genai_client import get_genai_client
 from app.services.label_service import overlay_labels, overlay_room_labels
+from app.services import image_provider
 
 logger = logging.getLogger(__name__)
 
@@ -16,15 +17,71 @@ RETRY_BASE_DELAY = 2.0
 GEMINI_CALL_TIMEOUT = 180  # seconds per Gemini API call attempt
 
 
-def get_views_to_generate(property_type: str, multi_story: bool = False, num_stories: int = 1) -> list[str]:
+def get_interior_zones(num_bedrooms: int = 3, kitchen_type: str = "Open") -> list[dict]:
+    """Room zones shown as 4-angle interior composites, derived from the spec.
+
+    Capped at 5 zones so large specs can't spike generation time/cost.
+    """
+    open_kitchen = (kitchen_type or "Open").lower() == "open"
+    zones: list[dict] = []
+    if open_kitchen:
+        zones.append({
+            "key": "zone_living_kitchen",
+            "title": "Living & Kitchen",
+            "desc": "the open-plan LIVING & KITCHEN area: sofa seating, coffee table, kitchen island, cabinetry and dining table",
+        })
+    else:
+        zones.append({
+            "key": "zone_living",
+            "title": "Living Room",
+            "desc": "the LIVING ROOM: sofa seating, coffee table, media wall and large windows",
+        })
+        zones.append({
+            "key": "zone_kitchen_dining",
+            "title": "Kitchen & Dining",
+            "desc": "the enclosed KITCHEN & DINING area: full cabinetry, countertops, and the dining table",
+        })
+    zones.append({
+        "key": "zone_master_suite",
+        "title": "Master Suite",
+        "desc": "the MASTER SUITE: the bed with headboard, bedside tables, wardrobe and en-suite bathroom glimpse",
+    })
+    extra_bedrooms = max(0, num_bedrooms - 1)
+    if extra_bedrooms <= 2:
+        for i in range(extra_bedrooms):
+            zones.append({
+                "key": f"zone_bedroom_{i + 2}",
+                "title": f"Bedroom {i + 2}",
+                "desc": f"BEDROOM {i + 2}: the bed, nightstands, window and wardrobe",
+            })
+    elif extra_bedrooms > 0:
+        zones.append({
+            "key": "zone_bedrooms",
+            "title": "Bedrooms",
+            "desc": "one of the secondary BEDROOMS: the bed, nightstands, window and wardrobe",
+        })
+    zones.append({
+        "key": "zone_bathrooms",
+        "title": "Bathroom",
+        "desc": "the BATHROOM: vanity, walk-in shower or bathtub, wc and tiled walls",
+    })
+    return zones[:5]
+
+
+def get_views_to_generate(
+    property_type: str,
+    multi_story: bool = False,
+    num_stories: int = 1,
+    num_bedrooms: int = 3,
+    kitchen_type: str = "Open",
+) -> list[str]:
     views = [
         "floor_plans_composite",
         "elevations_composite",
         "exterior_3d_composite",
-        "interior_living_composite",
-        "master_suite_composite",
-        "topdown_3d_view",
     ]
+    views.extend(z["key"] for z in get_interior_zones(num_bedrooms, kitchen_type))
+    views.append("topdown_3d_view")
     if multi_story and num_stories >= 2:
         views.append("topdown_3d_ground_floor")
         views.append("topdown_3d_upper_floor")
@@ -32,18 +89,19 @@ def get_views_to_generate(property_type: str, multi_story: bool = False, num_sto
     return views
 
 
-def get_view_labels() -> dict[str, str]:
-    return {
+def get_view_labels(num_bedrooms: int = 3, kitchen_type: str = "Open") -> dict[str, str]:
+    labels = {
         "floor_plans_composite": "Floor Plans",
         "elevations_composite": "Elevations",
         "exterior_3d_composite": "3D Exterior",
-        "interior_living_composite": "Living & Kitchen",
-        "master_suite_composite": "Master Suite",
         "topdown_3d_view": "3D Top-Down View",
         "topdown_3d_ground_floor": "Ground Floor (Top-Down)",
         "topdown_3d_upper_floor": "Upper Floor (Top-Down)",
         "measurements_table": "Room Measurements",
     }
+    for z in get_interior_zones(num_bedrooms, kitchen_type):
+        labels[z["key"]] = z["title"]
+    return labels
 
 
 QUALITY_SUFFIX = (
@@ -68,12 +126,13 @@ def build_prompt(
     num_kitchens: int = 1,
     num_living_rooms: int = 1,
     building_type: str = "single_family",
+    kitchen_type: str = "Open",
 ) -> str:
-    wabi_sabi_style = (
-        "warm wabi-sabi style. Use light natural wood, textured plaster or limewash walls, soft stone surfaces, linen fabrics, "
-        "and earthy tones like beige, sand, taupe, and muted brown. Keep furniture minimal, low-profile, and organic in shape. "
-        "Add subtle imperfections, handmade decor, ceramics, and light greenery for a lived-in natural feel. "
-        "Ensure the layout feels calm, uncluttered, and balanced. Use soft natural lighting, as if daylight is coming through the windows. "
+    interior_style = (
+        f"warm contemporary interior consistent with a {architectural_style} exterior architecture. "
+        "Use quality tropical-hardwood furniture and joinery, polished concrete or large-format tile floors, "
+        "crisp plastered walls in warm neutral tones, and locally woven textiles and decor accents. "
+        "Ensure generous natural cross-ventilation and daylight, with soft natural lighting as if coming through the windows. "
         "Maintain a clean, premium interior design look with photorealistic materials and textures, high detail, interior design visualization quality, no text, no UI elements."
     )
 
@@ -210,29 +269,20 @@ def build_prompt(
             f"A premium photorealistic 3D exterior rendering composite of a {base_info}. "
             f"{story_info} "
             f"The building has a {roof_type.lower()} roof. "
-            "Split-screen layout. LEFT HALF: FRONT exterior view of the house — eye-level perspective showing the main entrance, "
+            "Split-screen layout. LEFT HALF: FRONT exterior view of the house  eye-level perspective showing the main entrance, "
             "landscaped front yard, facade details, and entrance. "
-            "RIGHT HALF: REAR exterior view — showing the back patio, terrace, garden, and rear facade. "
+            "RIGHT HALF: REAR exterior view  showing the back patio, terrace, garden, and rear facade. "
             f"{master_seed} Professional architectural visualization, dramatic golden hour lighting, "
             "vibrant greens, blue sky, ultra-detailed materials and textures. "
             f"{QUALITY_SUFFIX}"
         ),
         "interior_living_composite": (
             f"Split-screen interior rendering composite of a {base_info}. "
-            "LEFT HALF: LIVING ROOM — eye-level view showing the main seating area, large windows, "
+            "LEFT HALF: LIVING ROOM  eye-level view showing the main seating area, large windows, "
             "coffee table, and natural light flooding the space. "
-            "RIGHT HALF: KITCHEN & DINING — wide-angle view showing the kitchen island, cabinetry, "
+            "RIGHT HALF: KITCHEN & DINING  wide-angle view showing the kitchen island, cabinetry, "
             f"dining table, and adjacent breakfast area. "
-            f"Style: {wabi_sabi_style} Both halves must show the exact same material palette and design language. "
-            f"{QUALITY_SUFFIX}"
-        ),
-        "master_suite_composite": (
-            f"Split-screen interior rendering composite of a {base_info}. "
-            "LEFT HALF: MASTER BEDROOM — eye-level view showing the bed, bedside tables, large windows, "
-            "walk-in closet entrance, and soft natural lighting. "
-            "RIGHT HALF: LUXURY BATHROOM — showing the double vanity, freestanding bathtub, "
-            f"glass shower, and premium tilework. "
-            f"Style: {wabi_sabi_style} Spa-like atmosphere. Both halves must feel like the same cohesive suite. "
+            f"Style: {interior_style} Both halves must show the exact same material palette and design language. "
             f"{QUALITY_SUFFIX}"
         ),
         "topdown_3d_view": (
@@ -284,18 +334,38 @@ def build_prompt(
             "Style: Clean architectural schedule format with thin grid lines, "
             "a header row in dark gray with white text, alternating light gray and white rows, "
             "and professional sans-serif fonts. "
-            "The header should read 'ROOM SCHEDULE — ROOM MEASUREMENTS' in bold centered text. "
+            "The header should read 'ROOM SCHEDULE  ROOM MEASUREMENTS' in bold centered text. "
             "White background, professional architectural presentation quality. "
             "Dimensions and areas must be realistic and proportional for a house of this size. "
             "Do NOT add any text outside the table."
         ),
     }
 
-    prompt = prompts.get(view_type, prompts["exterior_3d_composite"])
+    if view_type.startswith("zone_"):
+        zone = next((z for z in get_interior_zones(num_rooms, kitchen_type) if z["key"] == view_type), None)
+        zone_desc = zone["desc"] if zone else "the room interior"
+        zone_title = zone["title"] if zone else view_type
+        prompt = (
+            f"A single photorealistic interior rendering presented as a 2x2 GRID of four photographs "
+            f"(separated by clean 12px white gutters) showing THE SAME {zone_title} of a {base_info}, "
+            f"captured from four different camera angles: "
+            "TOP-LEFT: eye-level view from the room entrance; "
+            "TOP-RIGHT: three-quarter corner view; "
+            "BOTTOM-LEFT: view toward the windows showing natural light; "
+            "BOTTOM-RIGHT: reverse view from the opposite corner. "
+            f"The room shown is {zone_desc}. "
+            "All four photographs must show the IDENTICAL room: same furniture placement, same materials, "
+            "same finishes, same decor, same lighting — only the camera angle changes between panels. "
+            "The four photographs together must read as one continuous, believable space. "
+            f"Style: {interior_style} "
+            f"{QUALITY_SUFFIX}"
+        )
+    else:
+        prompt = prompts.get(view_type, prompts["exterior_3d_composite"])
     if additional_preferences:
         prompt += f" Special user requirements to integrate: {additional_preferences}."
     if reference_analysis:
-        prompt += f"\n\nReference floor plan analysis — use these insights to improve the design: {reference_analysis}"
+        prompt += f"\n\nReference floor plan analysis  use these insights to improve the design: {reference_analysis}"
 
     return prompt
 
@@ -317,26 +387,25 @@ async def generate_images(
     key_rooms: Optional[list[str]] = None,
     outdoor_spaces: Optional[list[str]] = None,
 ) -> tuple[str, list[bytes]]:
-    views_to_generate = get_views_to_generate(property_type, multi_story=is_multi_story, num_stories=num_stories)
-    labels = get_view_labels()
-    client = get_genai_client()
+    views_to_generate = get_views_to_generate(
+        property_type, multi_story=is_multi_story, num_stories=num_stories,
+        num_bedrooms=num_rooms, kitchen_type=kitchen_type,
+    )
+    labels = get_view_labels(num_bedrooms=num_rooms, kitchen_type=kitchen_type)
 
     async def generate_gemini_image(prompt_text: str) -> Optional[bytes]:
-        try:
-            def call():
-                return client.models.generate_content(
-                    model="gemini-2.5-flash-image",
-                    contents=prompt_text,
-                    config=types.GenerateContentConfig(response_modalities=["Image", "Text"])
-                )
-            response = await asyncio.to_thread(call)
-            for part in response.candidates[0].content.parts:
-                if part.inline_data and part.inline_data.mime_type.startswith("image/"):
-                    return part.inline_data.data
-            return None
-        except Exception as e:
-            print(f"Gemini Error: {e}")
-            return None
+        for attempt in range(1 + MAX_VIEW_RETRIES):
+            try:
+                return await image_provider.generate_image_once(prompt_text, view_label=view)
+            except Exception as e:
+                error_str = str(e)
+                if attempt < MAX_VIEW_RETRIES:
+                    delay = 15.0 * (3 ** attempt) if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str else RETRY_BASE_DELAY * (2 ** attempt)
+                    print(f"Image Error (attempt {attempt+1}): {e}. Retrying in {delay}s...")
+                    await asyncio.sleep(delay)
+                else:
+                    print(f"Image Error (final attempt {attempt+1}): {e}")
+                    return None
 
     all_images = []
     master_prompt = ""
@@ -347,7 +416,7 @@ async def generate_images(
             num_kitchens=num_kitchens, num_living_rooms=num_living_rooms,
         )
         if i == 0: master_prompt = prompt
-        print(f"Generating {view} via Gemini (gemini-2.5-flash-image)...")
+        print(f"Generating {view} via {image_provider.describe()}...")
         img_bytes = await generate_gemini_image(prompt)
         if img_bytes:
             labeled_bytes = overlay_labels(
@@ -394,8 +463,11 @@ async def generate_images_stream(
         yield {"type": "cancelled"}
         return
 
-    views_to_generate = get_views_to_generate(property_type, multi_story=is_multi_story, num_stories=num_stories)
-    labels = get_view_labels()
+    views_to_generate = get_views_to_generate(
+        property_type, multi_story=is_multi_story, num_stories=num_stories,
+        num_bedrooms=num_rooms, kitchen_type=kitchen_type,
+    )
+    labels = get_view_labels(num_bedrooms=num_rooms, kitchen_type=kitchen_type)
 
     view_list = [{"key": v, "label": labels[v]} for v in views_to_generate]
     yield {"type": "view_list", "views": view_list}
@@ -412,81 +484,27 @@ async def generate_images_stream(
         ref_mime_type: str = "image/jpeg",
         view_label: str = "",
     ) -> Optional[bytes]:
-        contents_parts = [types.Part(text=prompt_text)]
-        if ref_image:
-            contents_parts.append(
-                types.Part(inline_data=types.Blob(mime_type=ref_mime_type, data=ref_image))
-            )
-
         last_error = None
         for attempt in range(1 + MAX_VIEW_RETRIES):
+            t0 = time.monotonic()
             try:
-                def call():
-                    return client.models.generate_content(
-                        model="gemini-2.5-flash-image",
-                        contents=types.Content(parts=contents_parts, role="user"),
-                        config=types.GenerateContentConfig(response_modalities=["Image", "Text"])
-                    )
-                t0 = time.monotonic()
-                try:
-                    response = await asyncio.wait_for(asyncio.to_thread(call), timeout=GEMINI_CALL_TIMEOUT)
-                except asyncio.TimeoutError:
-                    elapsed = time.monotonic() - t0
-                    logger.warning(
-                        "[Gemini] %s: call timed out after %.1fs (attempt %d/%d)",
-                        view_label, elapsed, attempt + 1, 1 + MAX_VIEW_RETRIES,
-                    )
-                    last_error = f"timeout_{GEMINI_CALL_TIMEOUT}s"
-                    if attempt < MAX_VIEW_RETRIES:
-                        delay = RETRY_BASE_DELAY * (2 ** attempt)
-                        await asyncio.sleep(delay)
-                        continue
-                    return None
-                elapsed = time.monotonic() - t0
-
-                candidates = getattr(response, "candidates", None) or []
-                if not candidates:
-                    logger.warning(
-                        "[Gemini] %s: no candidates returned (attempt %d/%d, %.1fs)",
-                        view_label, attempt + 1, 1 + MAX_VIEW_RETRIES, elapsed,
-                    )
-                    last_error = "no_candidates"
-                    if attempt < MAX_VIEW_RETRIES:
-                        delay = RETRY_BASE_DELAY * (2 ** attempt)
-                        logger.info("[Gemini] %s: retrying in %.1fs...", view_label, delay)
-                        await asyncio.sleep(delay)
-                        continue
-                    return None
-
-                candidate = candidates[0]
-                parts = getattr(getattr(candidate, "content", None), "parts", None) or []
-                for part in parts:
-                    if part.inline_data and part.inline_data.mime_type.startswith("image/"):
-                        logger.info(
-                            "[Gemini] %s: image generated (%.1fs, attempt %d)",
-                            view_label, elapsed, attempt + 1,
-                        )
-                        return part.inline_data.data
-
-                text_parts = [p.text for p in parts if hasattr(p, "text") and p.text]
-                logger.warning(
-                    "[Gemini] %s: no image in response (attempt %d/%d, %.1fs). Text: %s",
-                    view_label, attempt + 1, 1 + MAX_VIEW_RETRIES, elapsed,
-                    text_parts[:2] if text_parts else "(none)",
+                img = await image_provider.generate_image_once(
+                    prompt_text, ref_image=ref_image, ref_mime_type=ref_mime_type, view_label=view_label,
                 )
-                last_error = "no_image_in_response"
-                if attempt < MAX_VIEW_RETRIES:
-                    delay = RETRY_BASE_DELAY * (2 ** attempt)
-                    logger.info("[Gemini] %s: retrying in %.1fs...", view_label, delay)
-                    await asyncio.sleep(delay)
+                elapsed = time.monotonic() - t0
+                logger.info(
+                    "[ImageProvider] %s: image generated (%.1fs, attempt %d)",
+                    view_label, elapsed, attempt + 1,
+                )
+                return img
 
             except Exception as e:
-                elapsed = time.monotonic() - t0 if 't0' in dir() else 0
+                elapsed = time.monotonic() - t0
                 error_type = type(e).__name__
                 error_str = str(e)
                 is_rate_limit = "429" in error_str or "RESOURCE_EXHAUSTED" in error_str
                 logger.error(
-                    "[Gemini] %s: exception (attempt %d/%d, %.1fs): %s: %s",
+                    "[ImageProvider] %s: exception (attempt %d/%d, %.1fs): %s: %s",
                     view_label, attempt + 1, 1 + MAX_VIEW_RETRIES, elapsed,
                     error_type, e,
                 )
@@ -496,14 +514,30 @@ async def generate_images_stream(
                         delay = 15.0 * (3 ** attempt)  # 15s, 45s for 429s
                     else:
                         delay = RETRY_BASE_DELAY * (2 ** attempt)  # 2s, 4s for other errors
-                    logger.info("[Gemini] %s: retrying in %.1fs (%s)...", view_label, delay, "rate_limit" if is_rate_limit else "error")
+                    logger.info("[ImageProvider] %s: retrying in %.1fs (%s)...", view_label, delay, "rate_limit" if is_rate_limit else "error")
                     await asyncio.sleep(delay)
 
-        logger.error("[Gemini] %s: all %d attempts exhausted. Last error: %s", view_label, 1 + MAX_VIEW_RETRIES, last_error)
+        logger.error("[ImageProvider] %s: all %d attempts exhausted. Last error: %s", view_label, 1 + MAX_VIEW_RETRIES, last_error)
         return None
 
     layout_resolved = False
     resolved_layout = None
+    async def _resolve_layout():
+        nonlocal layout_resolved, resolved_layout
+        if layout_resolved:
+            return resolved_layout
+        if layout is not None:
+            resolved_layout, layout_resolved = layout, True
+            return resolved_layout
+        if layout_task is None:
+            return None
+        try:
+            resolved_layout = await asyncio.wait_for(layout_task, timeout=60)
+            layout_resolved = True
+        except (asyncio.TimeoutError, Exception) as e:
+            logger.warning("[SheetRenderer] Could not resolve layout: %s", e)
+        return resolved_layout
+
     for i, view in enumerate(views_to_generate):
         try:
             if cancel_event and cancel_event.is_set():
@@ -514,12 +548,52 @@ async def generate_images_stream(
             if i > 0:
                 await asyncio.sleep(2)
 
+            # ── Deterministic views rendered from real geometry (no AI) ─────
+            if view in ("floor_plans_composite", "measurements_table"):
+                yield {"type": "view_start", "view_key": view, "label": labels[view]}
+                yield {"type": "progress", "progress_type": "generating", "label": labels[view]}
+                lay = await _resolve_layout()
+                rendered: list[tuple[str, str, bytes]] = []  # (view_key, label, png)
+                if lay is not None:
+                    try:
+                        from app.services import plan_sheet_renderer
+                        if view == "floor_plans_composite":
+                            floors = [("GROUND FLOOR PLAN", "A-101")]
+                            if num_stories > 1:
+                                floors.append(("UPPER FLOOR PLAN", "A-102"))
+                            floor_labels = {"A-101": "Ground Floor Plan", "A-102": "Upper Floor Plan"}
+                            for title, sheet in floors:
+                                png = await asyncio.to_thread(
+                                    plan_sheet_renderer.render_plan_sheet,
+                                    lay, "color", overlay_language, f"{architectural_style} Residence",
+                                    title.title(), sheet,
+                                )
+                                vlabel = labels[view] if len(floors) == 1 else floor_labels[sheet]
+                                rendered.append((view if len(floors) == 1 else f"{view}_{sheet}", vlabel, png))
+                        else:
+                            png = await asyncio.to_thread(
+                                plan_sheet_renderer.render_room_schedule,
+                                lay, overlay_language, f"{architectural_style} Residence",
+                            )
+                            rendered.append((view, labels[view], png))
+                    except Exception as rend_err:
+                        logger.error("[SheetRenderer] %s deterministic render failed: %s", view, rend_err)
+
+                if rendered:
+                    for vkey, vlabel, png in rendered:
+                        yield {"type": "view_complete", "view_key": vkey, "label": vlabel}
+                        yield {"type": "image", "label": vlabel, "view_key": vkey, "bytes": png}
+                    continue
+                # Layout unavailable — fall through to AI rendering below
+                logger.warning("[SheetRenderer] %s: no layout; falling back to AI view", view)
+
             prompt = build_prompt(
                 property_type, num_rooms, num_bathrooms, land_size, architectural_style, view,
                 additional_preferences, num_stories=num_stories, roof_type=roof_type,
                 reference_analysis=reference_analysis,
                 num_kitchens=num_kitchens, num_living_rooms=num_living_rooms,
                 building_type=building_type,
+                kitchen_type=kitchen_type,
             )
             if i == 0:
                 yield {"type": "master_prompt", "prompt": prompt}
@@ -584,7 +658,8 @@ async def generate_images_stream(
                     labeled_bytes = img_bytes
 
                 yield {"type": "view_complete", "view_key": view, "label": labels[view]}
-                yield {"type": "image", "label": labels[view], "bytes": labeled_bytes}
+                # Zone views are generated as a single composite image containing all 4 camera angles
+                yield {"type": "image", "label": labels[view], "view_key": view, "bytes": labeled_bytes}
             else:
                 yield {"type": "view_error", "view_key": view, "label": labels[view]}
                 yield {"type": "progress", "message": f"Failed to generate {labels[view]}."}
@@ -618,40 +693,35 @@ async def generate_single_view(
         property_type, num_rooms, num_bathrooms, land_size, architectural_style, view_type,
         additional_preferences, num_stories=num_stories, roof_type=roof_type,
         num_kitchens=num_kitchens, num_living_rooms=num_living_rooms,
+        kitchen_type=kitchen_type,
     )
 
-    try:
-        def call():
-            return client.models.generate_content(
-                model="gemini-2.5-flash-image",
-                contents=prompt,
-                config=types.GenerateContentConfig(response_modalities=["Image", "Text"])
-            )
+    for attempt in range(1 + MAX_VIEW_RETRIES):
+        try:
+            print(f"Regenerating {view_type} via {image_provider.describe()} (attempt {attempt+1})...")
+            img_bytes = await image_provider.generate_image_once(prompt, view_label=view_type)
 
-        print(f"Regenerating {view_type} via Gemini (gemini-2.5-flash-image)...")
-        response = await asyncio.to_thread(call)
+            if img_bytes:
+                return overlay_labels(
+                    img_bytes, view_type,
+                    language=overlay_language,
+                    num_bedrooms=num_rooms,
+                    num_bathrooms=num_bathrooms,
+                    kitchen_type=kitchen_type,
+                    key_rooms=key_rooms,
+                    outdoor_spaces=outdoor_spaces,
+                )
 
-        img_bytes = None
-        for part in response.candidates[0].content.parts:
-            if part.inline_data and part.inline_data.mime_type.startswith("image/"):
-                img_bytes = part.inline_data.data
-                break
-
-        if img_bytes:
-            return overlay_labels(
-                img_bytes, view_type,
-                language=overlay_language,
-                num_bedrooms=num_rooms,
-                num_bathrooms=num_bathrooms,
-                kitchen_type=kitchen_type,
-                key_rooms=key_rooms,
-                outdoor_spaces=outdoor_spaces,
-            )
-
-        return None
-    except Exception as e:
-        print(f"Gemini Error regenerating {view_type}: {e}")
-        return None
+            return None
+        except Exception as e:
+            error_str = str(e)
+            if attempt < MAX_VIEW_RETRIES:
+                delay = 15.0 * (3 ** attempt) if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str else RETRY_BASE_DELAY * (2 ** attempt)
+                print(f"Image Error regenerating {view_type} (attempt {attempt+1}): {e}. Retrying in {delay}s...")
+                await asyncio.sleep(delay)
+            else:
+                print(f"Gemini Error regenerating {view_type} (final attempt {attempt+1}): {e}")
+                return None
 
 
 async def _generate_placeholder_images(num_images: int) -> list[bytes]:
@@ -697,7 +767,7 @@ async def analyze_floor_plan_pdf(pdf_bytes: bytes, lang: str = "en") -> dict:
         prompt = (
             "Tu es un expert en analyse de plans d'architecture. Analyse ces images de plan d'étage.\n\n"
             "Réponds UNIQUEMENT en français. Les noms des pièces doivent rester dans leur langue "
-            "originale présente sur le plan (ex: 'Chambre', 'Sejour', 'Cuisine') — ne les traduis PAS.\n\n"
+            "originale présente sur le plan (ex: 'Chambre', 'Sejour', 'Cuisine')  ne les traduis PAS.\n\n"
             "Retourne ton analyse sous forme d'objet JSON avec ces clés :\n"
             "1. \"rooms\": une liste d'objets, chacun avec \"name\" (string, ex: \"Chambre\"), "
             "\"dimensions\" (string, ex: \"5m x 4m\" si visible, ou \"non spécifié\"), "
@@ -725,7 +795,7 @@ async def analyze_floor_plan_pdf(pdf_bytes: bytes, lang: str = "en") -> dict:
         prompt = (
             "You are an expert architectural floor plan analyst. Analyze these floor plan images.\n\n"
             "Return your analysis as a JSON object with these keys:\n"
-            "1. \"rooms\": a list of objects, each with \"name\" (string — keep the original room name from the plan, "
+            "1. \"rooms\": a list of objects, each with \"name\" (string  keep the original room name from the plan, "
             "do NOT translate it, e.g. if the plan says 'Chambre' keep 'Chambre'), "
             "\"dimensions\" (string, e.g. \"5m x 4m\" if visible, or \"not specified\"), "
             "and \"floor\" (string, e.g. \"Ground\" or \"Upper\"). "
@@ -767,7 +837,7 @@ async def analyze_floor_plan_pdf(pdf_bytes: bytes, lang: str = "en") -> dict:
 
             images.append(img_bytes)
 
-            # Stop at 6 images — enough for most architectural sets
+            # Stop at 6 images  enough for most architectural sets
             if len(images) >= 6:
                 break
 
@@ -786,22 +856,35 @@ async def analyze_floor_plan_pdf(pdf_bytes: bytes, lang: str = "en") -> dict:
         logger.info(f"[analyze_floor_plan_pdf] Extracted {len(images)} page image(s) from {total_pages} total page(s)")
 
         # Send images to Gemini
-        def call():
-            return client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=[
-                    types.Content(role="user", parts=[
-                        types.Part(text=prompt),
-                        *[
-                            types.Part(inline_data=types.Blob(mime_type="image/png", data=img))
-                            for img in images
+        text = ""
+        for attempt in range(1 + MAX_VIEW_RETRIES):
+            try:
+                def call():
+                    return client.models.generate_content(
+                        model="gemini-2.5-flash",
+                        contents=[
+                            types.Content(role="user", parts=[
+                                types.Part(text=prompt),
+                                *[
+                                    types.Part(inline_data=types.Blob(mime_type="image/png", data=img))
+                                    for img in images
+                                ],
+                            ])
                         ],
-                    ])
-                ],
-            )
+                    )
 
-        response = await asyncio.to_thread(call)
-        text = response.candidates[0].content.parts[0].text
+                response = await asyncio.to_thread(call)
+                text = response.candidates[0].content.parts[0].text
+                break
+            except Exception as e:
+                error_str = str(e)
+                if attempt < MAX_VIEW_RETRIES:
+                    delay = 15.0 * (3 ** attempt) if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str else RETRY_BASE_DELAY * (2 ** attempt)
+                    logger.warning(f"[analyze_floor_plan_pdf] Gemini Error (attempt {attempt+1}): {e}. Retrying in {delay}s...")
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error(f"[analyze_floor_plan_pdf] Gemini Error (final attempt {attempt+1}): {e}")
+                    raise e
 
         text = text.strip()
         if text.startswith("```"):
@@ -850,21 +933,8 @@ async def generate_floor_plan_image(
     view_type: str = "floor_plan_main",
     overlay_language: str = "en",
 ) -> Optional[bytes]:
-    client = get_genai_client()
-
     try:
-        def call():
-            return client.models.generate_content(
-                model="gemini-2.5-flash-image",
-                contents=prompt,
-                config=types.GenerateContentConfig(response_modalities=["Image", "Text"]),
-            )
-        response = await asyncio.to_thread(call)
-        img_bytes = None
-        for part in response.candidates[0].content.parts:
-            if part.inline_data and part.inline_data.mime_type.startswith("image/"):
-                img_bytes = part.inline_data.data
-                break
+        img_bytes = await image_provider.generate_image_once(prompt, view_label=view_type)
         if img_bytes:
             return overlay_labels(img_bytes, view_type, language=overlay_language)
         return None
@@ -872,18 +942,7 @@ async def generate_floor_plan_image(
         print(f"Floor plan generation error: {e}")
         try:
             fallback_prompt = f"Professional architectural floor plan: {prompt[:200]}"
-            def call_fallback():
-                return client.models.generate_content(
-                    model="gemini-2.5-flash-image",
-                    contents=fallback_prompt,
-                    config=types.GenerateContentConfig(response_modalities=["Image", "Text"]),
-                )
-            response = await asyncio.to_thread(call_fallback)
-            img_bytes = None
-            for part in response.candidates[0].content.parts:
-                if part.inline_data and part.inline_data.mime_type.startswith("image/"):
-                    img_bytes = part.inline_data.data
-                    break
+            img_bytes = await image_provider.generate_image_once(fallback_prompt, view_label=view_type)
             if img_bytes:
                 return overlay_labels(img_bytes, view_type, language=overlay_language)
         except Exception as e2:
@@ -931,9 +990,9 @@ async def analyze_plot_image(image_bytes: bytes, lang: str = "en") -> dict:
             '8. "terrain_notes": notes détaillées sur le terrain (une phrase).\n\n'
             '9. "orientation_notes": orientation du terrain si visible.\n\n'
             '10. "constraints": tableau de contraintes observées.\n\n'
-            '11. "suggested_dimensions": objet avec "length_m" et "width_m" — dimensions suggérées en mètres.\n\n'
-            '12. "suggested_building_footprint": objet avec "length_m" et "width_m" — surface de construction suggérée.\n\n'
-            '13. "setback_suggestions": objet avec "front", "rear", "left", "right" (nombres) — retraits suggérés en mètres.\n\n'
+            '11. "suggested_dimensions": objet avec "length_m" et "width_m"  dimensions suggérées en mètres.\n\n'
+            '12. "suggested_building_footprint": objet avec "length_m" et "width_m"  surface de construction suggérée.\n\n'
+            '13. "setback_suggestions": objet avec "front", "rear", "left", "right" (nombres)  retraits suggérés en mètres.\n\n'
             '14. "access_info": (objet) {type: "servitude"|"route"|"autre", description: "..."}\n\n'
             '15. "nearby_references": tableau de numéros de titres fonciers à proximité (ex: "TF-32626/W")\n\n'
             "IMPORTANT : Retourne UNIQUEMENT du JSON valide. Pas de markdown, pas de code fences, pas de texte supplémentaire. "
@@ -967,9 +1026,9 @@ async def analyze_plot_image(image_bytes: bytes, lang: str = "en") -> dict:
             '8. "terrain_notes": detailed notes about the terrain (one sentence).\n\n'
             '9. "orientation_notes": orientation of the plot if visible.\n\n'
             '10. "constraints": array of observed constraints or notes.\n\n'
-            '11. "suggested_dimensions": object with "length_m" and "width_m" — suggested plot dimensions in meters.\n\n'
-            '12. "suggested_building_footprint": object with "length_m" and "width_m" — suggested building footprint.\n\n'
-            '13. "setback_suggestions": object with "front", "rear", "left", "right" (numbers) — suggested setbacks in meters.\n\n'
+            '11. "suggested_dimensions": object with "length_m" and "width_m"  suggested plot dimensions in meters.\n\n'
+            '12. "suggested_building_footprint": object with "length_m" and "width_m"  suggested building footprint.\n\n'
+            '13. "setback_suggestions": object with "front", "rear", "left", "right" (numbers)  suggested setbacks in meters.\n\n'
             '14. "access_info": (object) {type: "servitude"|"road"|"other", description: "..."}\n\n'
             '15. "nearby_references": array of nearby land title reference numbers (e.g. "TF-32626/W")\n\n'
             "CRITICAL: Return ONLY valid JSON. No markdown, no code fences, no extra text. "
